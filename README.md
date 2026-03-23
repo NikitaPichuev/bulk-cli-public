@@ -114,19 +114,19 @@ The bot automatically prepends `http://` when needed.
 4. Connect wallets:
 
 ```powershell
-node dist\cli.js batch-connect --file .wallets.json --proxies-file .proxies.txt --delay-ms 15000 --jitter-ms 15000
+node dist\cli.js batch-connect --file .wallets.json --proxies-file .proxies.txt --delay-ms 5000 --jitter-ms 5000
 ```
 
 5. Open BTC longs with random percent sizing:
 
 ```powershell
-node dist\cli.js batch-buy BTC 40-50% --file .wallets.json --proxies-file .proxies.txt --leverage 10 --delay-ms 15000 --jitter-ms 15000
+node dist\cli.js batch-buy BTC 40-50% --file .wallets.json --proxies-file .proxies.txt --leverage 10 --delay-ms 5000 --jitter-ms 5000
 ```
 
 6. Close BTC positions:
 
 ```powershell
-node dist\cli.js batch-close BTC --file .wallets.json --proxies-file .proxies.txt --delay-ms 15000 --jitter-ms 15000
+node dist\cli.js batch-close BTC --file .wallets.json --proxies-file .proxies.txt --delay-ms 5000 --jitter-ms 5000
 ```
 
 ## Seed Phrases
@@ -204,6 +204,7 @@ npm run build; if ($?) { node dist\cli.js batch-connect --file .wallets.json --p
 - Target API: `https://exchange-api.bulk.trade/api/v1`
 - This project is for Bulk testnet flow
 - `connect` sets max leverage for all available markets by default
+- Default batch delay is now `5-10` seconds between wallets
 - Batch connect retries temporary errors like `408`, `429`, and `5xx`
 
 ## Safety
