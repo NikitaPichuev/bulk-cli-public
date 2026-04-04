@@ -11,6 +11,7 @@ Commands:
 - `close`
 - `positions`
 - `daily-cycle`
+- `batch-daily-cycle`
 
 ## Config layout
 
@@ -111,6 +112,34 @@ Notes:
 - `daily-cycle` is designed for one configured account, not for batch wallets
 - activity tracking is local and stored only in the JSON state file
 - if a limit order does not lead to a visible position quickly, the bot cancels leftovers and falls back to market
+
+## Batch daily cycle
+
+`batch-daily-cycle` runs the same daily routine for wallets from `.wallets.json`.
+
+Important:
+
+- this mode can run for a very long time if you let it process many wallets with full hold and wait windows
+- use wallet filtering or a small limit per run
+- proxy assignment follows wallet row numbers from `.proxies.txt`
+
+Examples:
+
+```bash
+node dist/cli.js batch-daily-cycle --file .wallets.json --proxies-file .proxies.txt --max-wallets 3 --shuffle-wallets
+```
+
+Run only selected wallets:
+
+```bash
+node dist/cli.js batch-daily-cycle --file .wallets.json --proxies-file .proxies.txt --wallets wallet-1,wallet-7,wallet-12
+```
+
+Dry run:
+
+```bash
+node dist/cli.js batch-daily-cycle --file .wallets.json --proxies-file .proxies.txt --max-wallets 2 --dry-run
+```
 
 ## Batch wallets
 

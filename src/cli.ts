@@ -53,6 +53,16 @@ interface DailyCycleCommandOptions {
   dryRun?: boolean;
 }
 
+interface BatchDailyCycleCommandOptions extends DailyCycleCommandOptions {
+  file?: string;
+  proxiesFile?: string;
+  delayMs?: string;
+  jitterMs?: string;
+  wallets?: string;
+  maxWallets?: string;
+  shuffleWallets?: boolean;
+}
+
 interface DailyCycleSettings {
   stateFile: string;
   symbols: string[];
@@ -78,6 +88,32 @@ interface PlannedDailyTrade {
   holdMs: number;
   waitBeforeMs: number;
   limitOffsetBps: number | null;
+}
+
+interface DailyCycleRunResult {
+  ok: boolean;
+  account: string;
+  localDate: string;
+  timezone: string;
+  stateFile: string;
+  activeDays: {
+    streak: number;
+    lastActiveDate?: string;
+  };
+  run: ActivityRunRecord;
+  trades: Array<Record<string, unknown>>;
+}
+
+interface DailyCycleDryRunResult {
+  ok: true;
+  dryRun: true;
+  account: string;
+  localDate: string;
+  timezone: string;
+  stateFile: string;
+  faucetAttemptPlanned: true;
+  settings: DailyCycleSettings;
+  trades: Array<Record<string, unknown>>;
 }
 
 const SYMBOL_ALIASES: Record<string, string> = {
@@ -352,6 +388,33 @@ program
   .option("--dry-run", "Print the planned routine without sending orders", false)
   .action(async (options: DailyCycleCommandOptions) => {
     await runDailyCycle(options);
+  });
+
+program
+  .command("batch-daily-cycle")
+  .description("Run the randomized daily trading routine for a batch wallet file")
+  .option("--file <path>", "Wallets JSON file", ".wallets.json")
+  .option("--proxies-file <path>", "Optional proxies text file, one proxy per line", ".proxies.txt")
+  .option("--delay-ms <ms>", "Base delay between wallets in milliseconds", "5000")
+  .option("--jitter-ms <ms>", "Random extra delay between wallets in milliseconds", "5000")
+  .option("--wallets <list>", "Comma-separated wallet names to include, for example wallet-1,wallet-7")
+  .option("--max-wallets <count>", "Maximum number of wallets to process in this run")
+  .option("--shuffle-wallets", "Shuffle wallet order before applying max-wallets", false)
+  .option("--state-file <path>", "Local JSON state file for faucet/activity tracking", ".activity-state.json")
+  .option("--symbols <list>", "Comma-separated symbols, for example BTC,ETH,SOL", "BTC,ETH,SOL")
+  .option("--min-trades <count>", "Minimum number of trades in this run", "3")
+  .option("--max-trades <count>", "Maximum number of trades in this run", "8")
+  .option("--size-range <range>", "Percent range per trade, for example 12-28%", "12-28%")
+  .option("--leverage <value>", "Leverage to set before routine trades", "2")
+  .option("--min-hold-minutes <minutes>", "Minimum hold time per position", "5")
+  .option("--max-hold-minutes <minutes>", "Maximum hold time per position", "30")
+  .option("--min-wait-minutes <minutes>", "Minimum wait between trades", "15")
+  .option("--max-wait-minutes <minutes>", "Maximum wait between trades", "90")
+  .option("--limit-probability <percent>", "How often to use limit orders instead of market orders", "40")
+  .option("--limit-offset-bps <bps>", "Aggressive limit offset in basis points", "8")
+  .option("--dry-run", "Print the planned routines without sending orders", false)
+  .action(async (options: BatchDailyCycleCommandOptions) => {
+    await runBatchDailyCycle(options);
   });
 
 program
@@ -1058,23 +1121,134 @@ async function runDailyCycle(options: DailyCycleCommandOptions): Promise<void> {
   const identity = requireTradingIdentity(config);
   const exchangeInfo = await api.getExchangeInfo();
   const settings = resolveDailyCycleSettings(options, exchangeInfo);
-  const localDate = getLocalDateString(new Date(), settings.timezone);
-  const plan = buildDailyTradePlan(settings);
-  const statePath = resolveActivityStateFile(settings.stateFile);
+  const result = await runDailyCycleForIdentity({
+    api,
+    config,
+    identity,
+    exchangeInfo,
+    settings,
+    dryRun: options.dryRun ?? false,
+    logPrefix: "daily-cycle"
+  });
+
+  console.log(JSON.stringify(result, null, 2));
+}
+
+async function runBatchDailyCycle(options: BatchDailyCycleCommandOptions): Promise<void> {
+  const config = loadConfig();
+  configureNetworking(config);
+  const api = new BulkApiClient(config.apiBaseUrl);
+  const exchangeInfo = await api.getExchangeInfo();
+  const settings = resolveDailyCycleSettings(options, exchangeInfo);
+  const filePath = resolveWalletFile(options.file ?? ".wallets.json");
+  const allProfiles = loadWalletProfiles(filePath).filter((item) => item.enabled !== false);
+  const proxies = resolveBatchProxies(options, allProfiles.length);
+  const selectedProfiles = selectBatchDailyCycleProfiles(allProfiles, options);
+  const walletPlan = getBatchPlan(selectedProfiles.length, options.delayMs, options.jitterMs);
+  const results: Array<Record<string, unknown>> = [];
+
+  console.log(`[batch-daily-cycle] wallets=${selectedProfiles.length}, file=${filePath}`);
+
+  for (let index = 0; index < selectedProfiles.length; index += 1) {
+    const selected = selectedProfiles[index];
+    const profile = selected.profile;
+    const proxyUrl = proxies[selected.originalIndex];
+    configureNetworking(config, proxyUrl);
+    logBatchProgress("daily-cycle", index, selectedProfiles.length, profile.name, walletPlan[index]);
+
+    if (walletPlan[index] > 0 && !options.dryRun) {
+      await sleep(walletPlan[index]);
+    }
+
+    if (!profile.accountAddress || !profile.agentSecretKey) {
+      results.push({
+        ok: false,
+        name: profile.name,
+        account: profile.accountAddress,
+        proxyUsed: maskProxyUrl(proxyUrl ?? config.proxyUrl),
+        scheduledAfterMs: walletPlan[index],
+        error: `Wallet "${profile.name}" is not connected. Run batch-connect first.`
+      });
+      console.log(`[batch-daily-cycle error] ${profile.name}: not connected`);
+      continue;
+    }
+
+    const identity: TradingIdentity = {
+      accountAddress: profile.accountAddress,
+      keypair: loadKeypair(profile.agentSecretKey)
+    };
+
+    try {
+      const result = await runDailyCycleForIdentity({
+        api,
+        config,
+        identity,
+        exchangeInfo,
+        settings,
+        dryRun: options.dryRun ?? false,
+        logPrefix: `${profile.name}/daily-cycle`
+      });
+
+      results.push({
+        ok: result.ok,
+        name: profile.name,
+        account: profile.accountAddress,
+        proxyUsed: maskProxyUrl(proxyUrl ?? config.proxyUrl),
+        scheduledAfterMs: walletPlan[index],
+        result
+      });
+      if ("activeDays" in result) {
+        console.log(`[batch-daily-cycle ok] ${profile.name} -> streak=${result.activeDays.streak}`);
+      } else {
+        console.log(`[batch-daily-cycle ok] ${profile.name} -> dry-run`);
+      }
+    } catch (error) {
+      results.push({
+        ok: false,
+        name: profile.name,
+        account: profile.accountAddress,
+        proxyUsed: maskProxyUrl(proxyUrl ?? config.proxyUrl),
+        scheduledAfterMs: walletPlan[index],
+        error: formatError(error)
+      });
+      console.log(`[batch-daily-cycle error] ${profile.name}: ${formatError(error)}`);
+    }
+  }
+
+  console.log(JSON.stringify({
+    ok: results.every((item) => item.ok === true),
+    dryRun: options.dryRun ?? false,
+    file: filePath,
+    wallets: results
+  }, null, 2));
+}
+
+async function runDailyCycleForIdentity(input: {
+  api: BulkApiClient;
+  config: EnvConfig;
+  identity: TradingIdentity;
+  exchangeInfo: ExchangeSymbolInfo[];
+  settings: DailyCycleSettings;
+  dryRun: boolean;
+  logPrefix: string;
+}): Promise<DailyCycleRunResult | DailyCycleDryRunResult> {
+  const localDate = getLocalDateString(new Date(), input.settings.timezone);
+  const plan = buildDailyTradePlan(input.settings);
+  const statePath = resolveActivityStateFile(input.settings.stateFile);
   const summaryTrades: Array<Record<string, unknown>> = [];
 
-  console.log(`[daily-cycle] account=${identity.accountAddress}, trades=${plan.length}, state=${statePath}`);
+  console.log(`[${input.logPrefix}] account=${input.identity.accountAddress}, trades=${plan.length}, state=${statePath}`);
 
-  if (options.dryRun) {
-    console.log(JSON.stringify({
+  if (input.dryRun) {
+    return {
       ok: true,
       dryRun: true,
-      account: identity.accountAddress,
+      account: input.identity.accountAddress,
       localDate,
-      timezone: settings.timezone,
+      timezone: input.settings.timezone,
       stateFile: statePath,
       faucetAttemptPlanned: true,
-      settings,
+      settings: input.settings,
       trades: plan.map((trade) => ({
         index: trade.index,
         symbol: trade.symbol,
@@ -1085,13 +1259,12 @@ async function runDailyCycle(options: DailyCycleCommandOptions): Promise<void> {
         waitBeforeMinutes: Math.round(trade.waitBeforeMs / 60_000),
         limitOffsetBps: trade.limitOffsetBps
       }))
-    }, null, 2));
-    return;
+    };
   }
 
-  const state = loadActivityState(statePath, settings.timezone);
-  state.timezone = settings.timezone;
-  const accountState = getOrCreateAccountActivity(state, identity.accountAddress);
+  const state = loadActivityState(statePath, input.settings.timezone);
+  state.timezone = input.settings.timezone;
+  const accountState = getOrCreateAccountActivity(state, input.identity.accountAddress);
   const runRecord: ActivityRunRecord = {
     startedAt: new Date().toISOString(),
     localDate,
@@ -1101,25 +1274,25 @@ async function runDailyCycle(options: DailyCycleCommandOptions): Promise<void> {
   };
 
   if (accountState.lastFaucetAttemptDate !== localDate) {
-    console.log("[daily-cycle] faucet check starting");
-    const testFunds = await ensureTestFundsReady(api, identity.keypair, false, identity.accountAddress);
+    console.log(`[${input.logPrefix}] faucet check starting`);
+    const testFunds = await ensureTestFundsReady(input.api, input.identity.keypair, false, input.identity.accountAddress);
     accountState.lastFaucetAttemptDate = localDate;
     runRecord.faucetStatus = testFunds.faucetStatus;
     saveActivityState(statePath, state);
   } else {
     runRecord.faucetStatus = "skipped_same_day";
-    console.log("[daily-cycle] faucet already attempted today, skipping");
+    console.log(`[${input.logPrefix}] faucet already attempted today, skipping`);
   }
 
   for (const trade of plan) {
     if (trade.waitBeforeMs > 0) {
-      console.log(`[daily-cycle] wait before trade ${trade.index}/${plan.length}: ${trade.waitBeforeMs}ms`);
+      console.log(`[${input.logPrefix}] wait before trade ${trade.index}/${plan.length}: ${trade.waitBeforeMs}ms`);
       await sleep(trade.waitBeforeMs);
     }
 
     try {
-      console.log(`[daily-cycle] trade ${trade.index}/${plan.length}: ${trade.side} ${trade.symbol} ${trade.sizeOrPercent} (${trade.orderType})`);
-      const result = await executeDailyTrade(api, config, identity, exchangeInfo, trade, settings.leverage);
+      console.log(`[${input.logPrefix}] trade ${trade.index}/${plan.length}: ${trade.side} ${trade.symbol} ${trade.sizeOrPercent} (${trade.orderType})`);
+      const result = await executeDailyTrade(input.api, input.config, input.identity, input.exchangeInfo, trade, input.settings.leverage);
       summaryTrades.push({
         ok: true,
         ...result
@@ -1140,7 +1313,7 @@ async function runDailyCycle(options: DailyCycleCommandOptions): Promise<void> {
         error: message
       });
       runRecord.tradesFailed += 1;
-      console.log(`[daily-cycle error] trade ${trade.index}: ${message}`);
+      console.log(`[${input.logPrefix} error] trade ${trade.index}: ${message}`);
       saveActivityState(statePath, state);
     }
   }
@@ -1151,11 +1324,11 @@ async function runDailyCycle(options: DailyCycleCommandOptions): Promise<void> {
   accountState.recentRuns = [runRecord, ...accountState.recentRuns].slice(0, 30);
   saveActivityState(statePath, state);
 
-  console.log(JSON.stringify({
+  return {
     ok: runRecord.tradesCompleted > 0 && runRecord.tradesFailed === 0,
-    account: identity.accountAddress,
+    account: input.identity.accountAddress,
     localDate,
-    timezone: settings.timezone,
+    timezone: input.settings.timezone,
     stateFile: statePath,
     activeDays: {
       streak: accountState.activeDaysStreak,
@@ -1163,7 +1336,7 @@ async function runDailyCycle(options: DailyCycleCommandOptions): Promise<void> {
     },
     run: runRecord,
     trades: summaryTrades
-  }, null, 2));
+  };
 }
 
 function resolveDailyCycleSettings(
@@ -1573,6 +1746,45 @@ function parseDailySymbols(raw: string, exchangeInfo: ExchangeSymbolInfo[]): str
   }
 
   return Array.from(new Set(symbols));
+}
+
+function selectBatchDailyCycleProfiles(
+  profiles: WalletProfile[],
+  options: BatchDailyCycleCommandOptions
+): Array<{ profile: WalletProfile; originalIndex: number }> {
+  const requestedNames = options.wallets
+    ? new Set(
+        options.wallets
+          .split(",")
+          .map((item) => item.trim())
+          .filter(Boolean)
+      )
+    : undefined;
+
+  let selected = profiles
+    .map((profile, originalIndex) => ({ profile, originalIndex }))
+    .filter((entry) => !requestedNames || requestedNames.has(entry.profile.name));
+
+  if (requestedNames && selected.length !== requestedNames.size) {
+    const foundNames = new Set(selected.map((entry) => entry.profile.name));
+    const missing = Array.from(requestedNames).filter((name) => !foundNames.has(name));
+    fail(`Unknown wallet names in --wallets: ${missing.join(", ")}`);
+  }
+
+  if (options.shuffleWallets) {
+    selected = shuffleArray(selected);
+  }
+
+  if (options.maxWallets) {
+    const maxWallets = parsePositiveIntegerOption(options.maxWallets, "max-wallets");
+    selected = selected.slice(0, maxWallets);
+  }
+
+  if (selected.length === 0) {
+    fail("No wallets selected for batch-daily-cycle.");
+  }
+
+  return selected;
 }
 
 function parsePositiveIntegerOption(raw: string, label: string): number {
