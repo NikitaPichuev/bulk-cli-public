@@ -2,7 +2,7 @@
 import fs from "fs";
 import { Command } from "commander";
 
-import { getOrCreateAccountActivity, loadActivityState, resolveActivityStateFile, saveActivityState, type ActivityRunRecord } from "./activityState";
+import { getOrCreateAccountActivity, loadActivityState, resolveActivityStateFile, saveActivityState, type ActivityRunRecord, type ActivityStateFile } from "./activityState";
 import { BulkApiClient, ensureAcceptedStatuses } from "./bulkApi";
 import { loadConfig, upsertEnvFile } from "./config";
 import { signAgentWalletAction, signFaucetAction, signOrderActions, signUserSettingsAction } from "./manualSigning";
@@ -115,6 +115,59 @@ interface DailyCycleDryRunResult {
   faucetAttemptPlanned: true;
   settings: DailyCycleSettings;
   trades: Array<Record<string, unknown>>;
+}
+
+class ApiActionSemaphore {
+  private active = 0;
+  private readonly waiting: Array<() => void> = [];
+
+  constructor(private readonly limit: number) {}
+
+  async run<T>(action: () => Promise<T>): Promise<T> {
+    if (this.active >= this.limit) {
+      await new Promise<void>((resolve) => {
+        this.waiting.push(resolve);
+      });
+    }
+
+    this.active += 1;
+
+    try {
+      return await action();
+    } finally {
+      this.active -= 1;
+      const next = this.waiting.shift();
+      if (next) {
+        next();
+      }
+    }
+  }
+}
+
+class RateLimitedBulkApiClient extends BulkApiClient {
+  constructor(
+    baseUrl: string,
+    private readonly semaphore: ApiActionSemaphore,
+    proxyUrl?: string | null
+  ) {
+    super(baseUrl, proxyUrl);
+  }
+
+  override async getExchangeInfo(): Promise<ExchangeSymbolInfo[]> {
+    return this.semaphore.run(() => super.getExchangeInfo());
+  }
+
+  override async getFullAccount(user: string): Promise<FullAccountState> {
+    return this.semaphore.run(() => super.getFullAccount(user));
+  }
+
+  override async submit(envelope: Parameters<BulkApiClient["submit"]>[0]): Promise<Awaited<ReturnType<BulkApiClient["submit"]>>> {
+    return this.semaphore.run(() => super.submit(envelope));
+  }
+
+  override async getReferencePrice(symbol: string): Promise<number> {
+    return this.semaphore.run(() => super.getReferencePrice(symbol));
+  }
 }
 
 const SYMBOL_ALIASES: Record<string, string> = {
@@ -1139,8 +1192,8 @@ async function runDailyCycle(options: DailyCycleCommandOptions): Promise<void> {
 async function runBatchDailyCycle(options: BatchDailyCycleCommandOptions): Promise<void> {
   const config = loadConfig();
   configureNetworking(config);
-  const api = new BulkApiClient(config.apiBaseUrl, config.proxyUrl);
-  const exchangeInfo = await api.getExchangeInfo();
+  const bootstrapApi = new BulkApiClient(config.apiBaseUrl, config.proxyUrl);
+  const exchangeInfo = await bootstrapApi.getExchangeInfo();
   const settings = resolveDailyCycleSettings(options, exchangeInfo);
   const filePath = resolveWalletFile(options.file ?? ".wallets.json");
   const allProfiles = loadWalletProfiles(filePath).filter((item) => item.enabled !== false);
@@ -1148,86 +1201,38 @@ async function runBatchDailyCycle(options: BatchDailyCycleCommandOptions): Promi
   const selectedProfiles = selectBatchDailyCycleProfiles(allProfiles, options);
   const walletPlan = getBatchPlan(selectedProfiles.length, options.delayMs, options.jitterMs);
   const concurrency = parsePositiveIntegerOption(options.concurrency ?? "3", "concurrency");
-  const results = new Array<Record<string, unknown>>(selectedProfiles.length);
-  let nextIndex = 0;
+  const semaphore = new ApiActionSemaphore(concurrency);
+  const sharedState = options.dryRun
+    ? undefined
+    : loadActivityState(resolveActivityStateFile(settings.stateFile), settings.timezone);
+
+  if (sharedState) {
+    sharedState.timezone = settings.timezone;
+  }
 
   console.log(`[batch-daily-cycle] wallets=${selectedProfiles.length}, file=${filePath}, concurrency=${concurrency}`);
 
-  const workerCount = Math.min(concurrency, selectedProfiles.length);
-
-  await Promise.all(Array.from({ length: workerCount }, (_, workerIndex) => runBatchDailyCycleWorker({
-    workerIndex,
-    getNextIndex: () => {
-      if (nextIndex >= selectedProfiles.length) {
-        return null;
-      }
-
-      const current = nextIndex;
-      nextIndex += 1;
-      return current;
-    },
-    selectedProfiles,
-    proxies,
-    walletPlan,
-    exchangeInfo,
-    settings,
-    options,
-    config,
-    results
-  })));
-
-  console.log(JSON.stringify({
-    ok: results.every((item) => item?.ok === true),
-    dryRun: options.dryRun ?? false,
-    file: filePath,
-    wallets: results
-  }, null, 2));
-}
-
-async function runBatchDailyCycleWorker(input: {
-  workerIndex: number;
-  getNextIndex: () => number | null;
-  selectedProfiles: Array<{ profile: WalletProfile; originalIndex: number }>;
-  proxies: Array<string | undefined>;
-  walletPlan: number[];
-  exchangeInfo: ExchangeSymbolInfo[];
-  settings: DailyCycleSettings;
-  options: BatchDailyCycleCommandOptions;
-  config: EnvConfig;
-  results: Array<Record<string, unknown>>;
-}): Promise<void> {
-  while (true) {
-    const index = input.getNextIndex();
-
-    if (index === null) {
-      return;
-    }
-
-    const selected = input.selectedProfiles[index];
+  const results = await Promise.all(selectedProfiles.map(async (selected, index) => {
     const profile = selected.profile;
-    const proxyUrl = input.proxies[selected.originalIndex];
-    const walletApi = new BulkApiClient(input.config.apiBaseUrl, proxyUrl ?? input.config.proxyUrl);
-    const workerLabel = `worker-${input.workerIndex + 1}`;
-    const logAction = `${workerLabel}/daily-cycle`;
+    const proxyUrl = proxies[selected.originalIndex];
+    const walletApi = new RateLimitedBulkApiClient(config.apiBaseUrl, semaphore, proxyUrl ?? config.proxyUrl);
 
-    logBatchProgress(logAction, index, input.selectedProfiles.length, profile.name, input.walletPlan[index]);
+    logBatchProgress("daily-cycle", index, selectedProfiles.length, profile.name, walletPlan[index]);
 
-    if (input.walletPlan[index] > 0 && !input.options.dryRun) {
-      await sleep(input.walletPlan[index]);
+    if (walletPlan[index] > 0 && !options.dryRun) {
+      await sleep(walletPlan[index]);
     }
 
     if (!profile.accountAddress || !profile.agentSecretKey) {
-      input.results[index] = {
+      console.log(`[batch-daily-cycle error] ${profile.name}: not connected`);
+      return {
         ok: false,
         name: profile.name,
         account: profile.accountAddress,
-        proxyUsed: maskProxyUrl(proxyUrl ?? input.config.proxyUrl),
-        scheduledAfterMs: input.walletPlan[index],
-        worker: input.workerIndex + 1,
+        proxyUsed: maskProxyUrl(proxyUrl ?? config.proxyUrl),
+        scheduledAfterMs: walletPlan[index],
         error: `Wallet "${profile.name}" is not connected. Run batch-connect first.`
       };
-      console.log(`[batch-daily-cycle error] ${profile.name}: not connected`);
-      continue;
     }
 
     const identity: TradingIdentity = {
@@ -1238,41 +1243,48 @@ async function runBatchDailyCycleWorker(input: {
     try {
       const result = await runDailyCycleForIdentity({
         api: walletApi,
-        config: input.config,
+        config,
         identity,
-        exchangeInfo: input.exchangeInfo,
-        settings: input.settings,
-        dryRun: input.options.dryRun ?? false,
-        logPrefix: `${workerLabel}/${profile.name}/daily-cycle`
+        exchangeInfo,
+        settings,
+        dryRun: options.dryRun ?? false,
+        logPrefix: `${profile.name}/daily-cycle`,
+        activityState: sharedState
       });
 
-      input.results[index] = {
+      if ("activeDays" in result) {
+        console.log(`[batch-daily-cycle ok] ${profile.name} -> streak=${result.activeDays.streak}`);
+      } else {
+        console.log(`[batch-daily-cycle ok] ${profile.name} -> dry-run`);
+      }
+
+      return {
         ok: result.ok,
         name: profile.name,
         account: profile.accountAddress,
-        proxyUsed: maskProxyUrl(proxyUrl ?? input.config.proxyUrl),
-        scheduledAfterMs: input.walletPlan[index],
-        worker: input.workerIndex + 1,
+        proxyUsed: maskProxyUrl(proxyUrl ?? config.proxyUrl),
+        scheduledAfterMs: walletPlan[index],
         result
       };
-      if ("activeDays" in result) {
-        console.log(`[batch-daily-cycle ok] ${profile.name} -> worker=${input.workerIndex + 1}, streak=${result.activeDays.streak}`);
-      } else {
-        console.log(`[batch-daily-cycle ok] ${profile.name} -> worker=${input.workerIndex + 1}, dry-run`);
-      }
     } catch (error) {
-      input.results[index] = {
+      console.log(`[batch-daily-cycle error] ${profile.name}: ${formatError(error)}`);
+      return {
         ok: false,
         name: profile.name,
         account: profile.accountAddress,
-        proxyUsed: maskProxyUrl(proxyUrl ?? input.config.proxyUrl),
-        scheduledAfterMs: input.walletPlan[index],
-        worker: input.workerIndex + 1,
+        proxyUsed: maskProxyUrl(proxyUrl ?? config.proxyUrl),
+        scheduledAfterMs: walletPlan[index],
         error: formatError(error)
       };
-      console.log(`[batch-daily-cycle error] ${profile.name}: ${formatError(error)}`);
     }
-  }
+  }));
+
+  console.log(JSON.stringify({
+    ok: results.every((item) => item.ok === true),
+    dryRun: options.dryRun ?? false,
+    file: filePath,
+    wallets: results
+  }, null, 2));
 }
 
 async function runDailyCycleForIdentity(input: {
@@ -1283,6 +1295,7 @@ async function runDailyCycleForIdentity(input: {
   settings: DailyCycleSettings;
   dryRun: boolean;
   logPrefix: string;
+  activityState?: ActivityStateFile;
 }): Promise<DailyCycleRunResult | DailyCycleDryRunResult> {
   const localDate = getLocalDateString(new Date(), input.settings.timezone);
   const plan = buildDailyTradePlan(input.settings);
@@ -1314,7 +1327,7 @@ async function runDailyCycleForIdentity(input: {
     };
   }
 
-  const state = loadActivityState(statePath, input.settings.timezone);
+  const state = input.activityState ?? loadActivityState(statePath, input.settings.timezone);
   state.timezone = input.settings.timezone;
   const accountState = getOrCreateAccountActivity(state, input.identity.accountAddress);
   const runRecord: ActivityRunRecord = {
