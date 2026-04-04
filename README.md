@@ -120,6 +120,7 @@ Notes:
 Important:
 
 - this mode can run for a very long time if you let it process many wallets with full hold and wait windows
+- by default it processes `3` wallets in parallel
 - use wallet filtering or a small limit per run
 - proxy assignment follows wallet row numbers from `.proxies.txt`
 
@@ -127,6 +128,12 @@ Examples:
 
 ```bash
 node dist/cli.js batch-daily-cycle --file .wallets.json --proxies-file .proxies.txt --max-wallets 3 --shuffle-wallets
+```
+
+Custom parallelism:
+
+```bash
+node dist/cli.js batch-daily-cycle --file .wallets.json --proxies-file .proxies.txt --max-wallets 6 --concurrency 3
 ```
 
 Run only selected wallets:

@@ -58,6 +58,7 @@ interface BatchDailyCycleCommandOptions extends DailyCycleCommandOptions {
   proxiesFile?: string;
   delayMs?: string;
   jitterMs?: string;
+  concurrency?: string;
   wallets?: string;
   maxWallets?: string;
   shuffleWallets?: boolean;
@@ -397,6 +398,7 @@ program
   .option("--proxies-file <path>", "Optional proxies text file, one proxy per line", ".proxies.txt")
   .option("--delay-ms <ms>", "Base delay between wallets in milliseconds", "5000")
   .option("--jitter-ms <ms>", "Random extra delay between wallets in milliseconds", "5000")
+  .option("--concurrency <count>", "How many wallets to process in parallel", "3")
   .option("--wallets <list>", "Comma-separated wallet names to include, for example wallet-1,wallet-7")
   .option("--max-wallets <count>", "Maximum number of wallets to process in this run")
   .option("--shuffle-wallets", "Shuffle wallet order before applying max-wallets", false)
@@ -1137,7 +1139,7 @@ async function runDailyCycle(options: DailyCycleCommandOptions): Promise<void> {
 async function runBatchDailyCycle(options: BatchDailyCycleCommandOptions): Promise<void> {
   const config = loadConfig();
   configureNetworking(config);
-  const api = new BulkApiClient(config.apiBaseUrl);
+  const api = new BulkApiClient(config.apiBaseUrl, config.proxyUrl);
   const exchangeInfo = await api.getExchangeInfo();
   const settings = resolveDailyCycleSettings(options, exchangeInfo);
   const filePath = resolveWalletFile(options.file ?? ".wallets.json");
@@ -1145,30 +1147,85 @@ async function runBatchDailyCycle(options: BatchDailyCycleCommandOptions): Promi
   const proxies = resolveBatchProxies(options, allProfiles.length);
   const selectedProfiles = selectBatchDailyCycleProfiles(allProfiles, options);
   const walletPlan = getBatchPlan(selectedProfiles.length, options.delayMs, options.jitterMs);
-  const results: Array<Record<string, unknown>> = [];
+  const concurrency = parsePositiveIntegerOption(options.concurrency ?? "3", "concurrency");
+  const results = new Array<Record<string, unknown>>(selectedProfiles.length);
+  let nextIndex = 0;
 
-  console.log(`[batch-daily-cycle] wallets=${selectedProfiles.length}, file=${filePath}`);
+  console.log(`[batch-daily-cycle] wallets=${selectedProfiles.length}, file=${filePath}, concurrency=${concurrency}`);
 
-  for (let index = 0; index < selectedProfiles.length; index += 1) {
-    const selected = selectedProfiles[index];
+  const workerCount = Math.min(concurrency, selectedProfiles.length);
+
+  await Promise.all(Array.from({ length: workerCount }, (_, workerIndex) => runBatchDailyCycleWorker({
+    workerIndex,
+    getNextIndex: () => {
+      if (nextIndex >= selectedProfiles.length) {
+        return null;
+      }
+
+      const current = nextIndex;
+      nextIndex += 1;
+      return current;
+    },
+    selectedProfiles,
+    proxies,
+    walletPlan,
+    exchangeInfo,
+    settings,
+    options,
+    config,
+    results
+  })));
+
+  console.log(JSON.stringify({
+    ok: results.every((item) => item?.ok === true),
+    dryRun: options.dryRun ?? false,
+    file: filePath,
+    wallets: results
+  }, null, 2));
+}
+
+async function runBatchDailyCycleWorker(input: {
+  workerIndex: number;
+  getNextIndex: () => number | null;
+  selectedProfiles: Array<{ profile: WalletProfile; originalIndex: number }>;
+  proxies: Array<string | undefined>;
+  walletPlan: number[];
+  exchangeInfo: ExchangeSymbolInfo[];
+  settings: DailyCycleSettings;
+  options: BatchDailyCycleCommandOptions;
+  config: EnvConfig;
+  results: Array<Record<string, unknown>>;
+}): Promise<void> {
+  while (true) {
+    const index = input.getNextIndex();
+
+    if (index === null) {
+      return;
+    }
+
+    const selected = input.selectedProfiles[index];
     const profile = selected.profile;
-    const proxyUrl = proxies[selected.originalIndex];
-    configureNetworking(config, proxyUrl);
-    logBatchProgress("daily-cycle", index, selectedProfiles.length, profile.name, walletPlan[index]);
+    const proxyUrl = input.proxies[selected.originalIndex];
+    const walletApi = new BulkApiClient(input.config.apiBaseUrl, proxyUrl ?? input.config.proxyUrl);
+    const workerLabel = `worker-${input.workerIndex + 1}`;
+    const logAction = `${workerLabel}/daily-cycle`;
 
-    if (walletPlan[index] > 0 && !options.dryRun) {
-      await sleep(walletPlan[index]);
+    logBatchProgress(logAction, index, input.selectedProfiles.length, profile.name, input.walletPlan[index]);
+
+    if (input.walletPlan[index] > 0 && !input.options.dryRun) {
+      await sleep(input.walletPlan[index]);
     }
 
     if (!profile.accountAddress || !profile.agentSecretKey) {
-      results.push({
+      input.results[index] = {
         ok: false,
         name: profile.name,
         account: profile.accountAddress,
-        proxyUsed: maskProxyUrl(proxyUrl ?? config.proxyUrl),
-        scheduledAfterMs: walletPlan[index],
+        proxyUsed: maskProxyUrl(proxyUrl ?? input.config.proxyUrl),
+        scheduledAfterMs: input.walletPlan[index],
+        worker: input.workerIndex + 1,
         error: `Wallet "${profile.name}" is not connected. Run batch-connect first.`
-      });
+      };
       console.log(`[batch-daily-cycle error] ${profile.name}: not connected`);
       continue;
     }
@@ -1180,47 +1237,42 @@ async function runBatchDailyCycle(options: BatchDailyCycleCommandOptions): Promi
 
     try {
       const result = await runDailyCycleForIdentity({
-        api,
-        config,
+        api: walletApi,
+        config: input.config,
         identity,
-        exchangeInfo,
-        settings,
-        dryRun: options.dryRun ?? false,
-        logPrefix: `${profile.name}/daily-cycle`
+        exchangeInfo: input.exchangeInfo,
+        settings: input.settings,
+        dryRun: input.options.dryRun ?? false,
+        logPrefix: `${workerLabel}/${profile.name}/daily-cycle`
       });
 
-      results.push({
+      input.results[index] = {
         ok: result.ok,
         name: profile.name,
         account: profile.accountAddress,
-        proxyUsed: maskProxyUrl(proxyUrl ?? config.proxyUrl),
-        scheduledAfterMs: walletPlan[index],
+        proxyUsed: maskProxyUrl(proxyUrl ?? input.config.proxyUrl),
+        scheduledAfterMs: input.walletPlan[index],
+        worker: input.workerIndex + 1,
         result
-      });
+      };
       if ("activeDays" in result) {
-        console.log(`[batch-daily-cycle ok] ${profile.name} -> streak=${result.activeDays.streak}`);
+        console.log(`[batch-daily-cycle ok] ${profile.name} -> worker=${input.workerIndex + 1}, streak=${result.activeDays.streak}`);
       } else {
-        console.log(`[batch-daily-cycle ok] ${profile.name} -> dry-run`);
+        console.log(`[batch-daily-cycle ok] ${profile.name} -> worker=${input.workerIndex + 1}, dry-run`);
       }
     } catch (error) {
-      results.push({
+      input.results[index] = {
         ok: false,
         name: profile.name,
         account: profile.accountAddress,
-        proxyUsed: maskProxyUrl(proxyUrl ?? config.proxyUrl),
-        scheduledAfterMs: walletPlan[index],
+        proxyUsed: maskProxyUrl(proxyUrl ?? input.config.proxyUrl),
+        scheduledAfterMs: input.walletPlan[index],
+        worker: input.workerIndex + 1,
         error: formatError(error)
-      });
+      };
       console.log(`[batch-daily-cycle error] ${profile.name}: ${formatError(error)}`);
     }
   }
-
-  console.log(JSON.stringify({
-    ok: results.every((item) => item.ok === true),
-    dryRun: options.dryRun ?? false,
-    file: filePath,
-    wallets: results
-  }, null, 2));
 }
 
 async function runDailyCycleForIdentity(input: {

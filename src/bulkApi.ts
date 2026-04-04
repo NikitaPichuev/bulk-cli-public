@@ -1,3 +1,6 @@
+import { Agent, ProxyAgent, type Dispatcher } from "undici";
+
+import { normalizeProxyUrlInput } from "./network";
 import type { ActionEnvelope, ExchangeSymbolInfo, FullAccountState } from "./types";
 
 interface ApiResponse {
@@ -11,7 +14,17 @@ interface ApiResponse {
 }
 
 export class BulkApiClient {
-  constructor(private readonly baseUrl: string) {}
+  private readonly dispatcher: Dispatcher;
+
+  constructor(
+    private readonly baseUrl: string,
+    proxyUrl?: string | null
+  ) {
+    const normalizedProxyUrl = normalizeProxyUrlInput(proxyUrl);
+    this.dispatcher = normalizedProxyUrl
+      ? new ProxyAgent(normalizedProxyUrl)
+      : new Agent();
+  }
 
   async getExchangeInfo(): Promise<ExchangeSymbolInfo[]> {
     const response = await this.request(`${this.baseUrl}/exchangeInfo`, undefined, "exchangeInfo");
@@ -78,8 +91,9 @@ export class BulkApiClient {
       try {
         const response = await fetch(url, {
           ...init,
-          signal: AbortSignal.timeout(20_000)
-        });
+          signal: AbortSignal.timeout(20_000),
+          dispatcher: this.dispatcher
+        } as RequestInit & { dispatcher: Dispatcher });
 
         if (response.ok || !shouldRetryStatus(response.status) || attempt === maxAttempts) {
           return response;
