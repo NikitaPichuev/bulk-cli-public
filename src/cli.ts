@@ -2,6 +2,7 @@
 import fs from "fs";
 import { Command } from "commander";
 
+import { getOrCreateAccountActivity, loadActivityState, resolveActivityStateFile, saveActivityState, type ActivityRunRecord } from "./activityState";
 import { BulkApiClient, ensureAcceptedStatuses } from "./bulkApi";
 import { loadConfig, upsertEnvFile } from "./config";
 import { signAgentWalletAction, signFaucetAction, signOrderActions, signUserSettingsAction } from "./manualSigning";
@@ -34,6 +35,49 @@ interface BatchCommandOptions {
   skipFaucet?: boolean;
   skipMaxLeverage?: boolean;
   leverage?: string;
+}
+
+interface DailyCycleCommandOptions {
+  stateFile?: string;
+  symbols?: string;
+  minTrades?: string;
+  maxTrades?: string;
+  sizeRange?: string;
+  leverage?: string;
+  minHoldMinutes?: string;
+  maxHoldMinutes?: string;
+  minWaitMinutes?: string;
+  maxWaitMinutes?: string;
+  limitProbability?: string;
+  limitOffsetBps?: string;
+  dryRun?: boolean;
+}
+
+interface DailyCycleSettings {
+  stateFile: string;
+  symbols: string[];
+  minTrades: number;
+  maxTrades: number;
+  sizeRange: string;
+  leverage: string;
+  minHoldMinutes: number;
+  maxHoldMinutes: number;
+  minWaitMinutes: number;
+  maxWaitMinutes: number;
+  limitProbability: number;
+  limitOffsetBps: number;
+  timezone: string;
+}
+
+interface PlannedDailyTrade {
+  index: number;
+  side: "buy" | "sell";
+  symbol: string;
+  sizeOrPercent: string;
+  orderType: "market" | "limit";
+  holdMs: number;
+  waitBeforeMs: number;
+  limitOffsetBps: number | null;
 }
 
 const SYMBOL_ALIASES: Record<string, string> = {
@@ -288,6 +332,26 @@ program
         reduceOnly: item.reduceOnly
       })));
     }
+  });
+
+program
+  .command("daily-cycle")
+  .description("Run a randomized daily trading routine for the configured account and track active days")
+  .option("--state-file <path>", "Local JSON state file for faucet/activity tracking", ".activity-state.json")
+  .option("--symbols <list>", "Comma-separated symbols, for example BTC,ETH,SOL", "BTC,ETH,SOL")
+  .option("--min-trades <count>", "Minimum number of trades in this run", "3")
+  .option("--max-trades <count>", "Maximum number of trades in this run", "8")
+  .option("--size-range <range>", "Percent range per trade, for example 12-28%", "12-28%")
+  .option("--leverage <value>", "Leverage to set before routine trades", "2")
+  .option("--min-hold-minutes <minutes>", "Minimum hold time per position", "5")
+  .option("--max-hold-minutes <minutes>", "Maximum hold time per position", "30")
+  .option("--min-wait-minutes <minutes>", "Minimum wait between trades", "15")
+  .option("--max-wait-minutes <minutes>", "Maximum wait between trades", "90")
+  .option("--limit-probability <percent>", "How often to use limit orders instead of market orders", "40")
+  .option("--limit-offset-bps <bps>", "Aggressive limit offset in basis points", "8")
+  .option("--dry-run", "Print the planned routine without sending orders", false)
+  .action(async (options: DailyCycleCommandOptions) => {
+    await runDailyCycle(options);
   });
 
 program
@@ -985,6 +1049,645 @@ async function executeBatchOrder(input: {
     file: filePath,
     wallets: results
   }, null, 2));
+}
+
+async function runDailyCycle(options: DailyCycleCommandOptions): Promise<void> {
+  const config = loadConfig();
+  configureNetworking(config);
+  const api = new BulkApiClient(config.apiBaseUrl);
+  const identity = requireTradingIdentity(config);
+  const exchangeInfo = await api.getExchangeInfo();
+  const settings = resolveDailyCycleSettings(options, exchangeInfo);
+  const localDate = getLocalDateString(new Date(), settings.timezone);
+  const plan = buildDailyTradePlan(settings);
+  const statePath = resolveActivityStateFile(settings.stateFile);
+  const summaryTrades: Array<Record<string, unknown>> = [];
+
+  console.log(`[daily-cycle] account=${identity.accountAddress}, trades=${plan.length}, state=${statePath}`);
+
+  if (options.dryRun) {
+    console.log(JSON.stringify({
+      ok: true,
+      dryRun: true,
+      account: identity.accountAddress,
+      localDate,
+      timezone: settings.timezone,
+      stateFile: statePath,
+      faucetAttemptPlanned: true,
+      settings,
+      trades: plan.map((trade) => ({
+        index: trade.index,
+        symbol: trade.symbol,
+        side: trade.side,
+        sizeOrPercent: trade.sizeOrPercent,
+        orderType: trade.orderType,
+        holdMinutes: Math.round(trade.holdMs / 60_000),
+        waitBeforeMinutes: Math.round(trade.waitBeforeMs / 60_000),
+        limitOffsetBps: trade.limitOffsetBps
+      }))
+    }, null, 2));
+    return;
+  }
+
+  const state = loadActivityState(statePath, settings.timezone);
+  state.timezone = settings.timezone;
+  const accountState = getOrCreateAccountActivity(state, identity.accountAddress);
+  const runRecord: ActivityRunRecord = {
+    startedAt: new Date().toISOString(),
+    localDate,
+    tradesPlanned: plan.length,
+    tradesCompleted: 0,
+    tradesFailed: 0
+  };
+
+  if (accountState.lastFaucetAttemptDate !== localDate) {
+    console.log("[daily-cycle] faucet check starting");
+    const testFunds = await ensureTestFundsReady(api, identity.keypair, false, identity.accountAddress);
+    accountState.lastFaucetAttemptDate = localDate;
+    runRecord.faucetStatus = testFunds.faucetStatus;
+    saveActivityState(statePath, state);
+  } else {
+    runRecord.faucetStatus = "skipped_same_day";
+    console.log("[daily-cycle] faucet already attempted today, skipping");
+  }
+
+  for (const trade of plan) {
+    if (trade.waitBeforeMs > 0) {
+      console.log(`[daily-cycle] wait before trade ${trade.index}/${plan.length}: ${trade.waitBeforeMs}ms`);
+      await sleep(trade.waitBeforeMs);
+    }
+
+    try {
+      console.log(`[daily-cycle] trade ${trade.index}/${plan.length}: ${trade.side} ${trade.symbol} ${trade.sizeOrPercent} (${trade.orderType})`);
+      const result = await executeDailyTrade(api, config, identity, exchangeInfo, trade, settings.leverage);
+      summaryTrades.push({
+        ok: true,
+        ...result
+      });
+      runRecord.tradesCompleted += 1;
+      accountState.totalTradesCompleted += 1;
+      markAccountActiveDay(accountState, localDate);
+      saveActivityState(statePath, state);
+    } catch (error) {
+      const message = formatError(error);
+      summaryTrades.push({
+        ok: false,
+        index: trade.index,
+        symbol: trade.symbol,
+        side: trade.side,
+        sizeOrPercent: trade.sizeOrPercent,
+        orderType: trade.orderType,
+        error: message
+      });
+      runRecord.tradesFailed += 1;
+      console.log(`[daily-cycle error] trade ${trade.index}: ${message}`);
+      saveActivityState(statePath, state);
+    }
+  }
+
+  runRecord.completedAt = new Date().toISOString();
+  accountState.lastRunAt = runRecord.completedAt;
+  accountState.totalRoutineRuns += 1;
+  accountState.recentRuns = [runRecord, ...accountState.recentRuns].slice(0, 30);
+  saveActivityState(statePath, state);
+
+  console.log(JSON.stringify({
+    ok: runRecord.tradesCompleted > 0 && runRecord.tradesFailed === 0,
+    account: identity.accountAddress,
+    localDate,
+    timezone: settings.timezone,
+    stateFile: statePath,
+    activeDays: {
+      streak: accountState.activeDaysStreak,
+      lastActiveDate: accountState.lastActiveDate
+    },
+    run: runRecord,
+    trades: summaryTrades
+  }, null, 2));
+}
+
+function resolveDailyCycleSettings(
+  options: DailyCycleCommandOptions,
+  exchangeInfo: ExchangeSymbolInfo[]
+): DailyCycleSettings {
+  const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  const symbols = parseDailySymbols(options.symbols ?? "BTC,ETH,SOL", exchangeInfo);
+  const minTrades = parsePositiveIntegerOption(options.minTrades ?? "3", "min-trades");
+  const maxTrades = parsePositiveIntegerOption(options.maxTrades ?? "8", "max-trades");
+  const minHoldMinutes = parsePositiveIntegerOption(options.minHoldMinutes ?? "5", "min-hold-minutes");
+  const maxHoldMinutes = parsePositiveIntegerOption(options.maxHoldMinutes ?? "30", "max-hold-minutes");
+  const minWaitMinutes = parsePositiveIntegerOption(options.minWaitMinutes ?? "15", "min-wait-minutes");
+  const maxWaitMinutes = parsePositiveIntegerOption(options.maxWaitMinutes ?? "90", "max-wait-minutes");
+  const leverage = options.leverage?.trim() || "2";
+  const limitProbability = parsePercentageOption(options.limitProbability ?? "40", "limit-probability");
+  const limitOffsetBps = parsePositiveIntegerOption(options.limitOffsetBps ?? "8", "limit-offset-bps");
+  const sizeRange = normalizePercentSizingInput(options.sizeRange ?? "12-28%");
+
+  if (minTrades > maxTrades) {
+    fail("min-trades must be less than or equal to max-trades.");
+  }
+
+  if (minHoldMinutes > maxHoldMinutes) {
+    fail("min-hold-minutes must be less than or equal to max-hold-minutes.");
+  }
+
+  if (minWaitMinutes > maxWaitMinutes) {
+    fail("min-wait-minutes must be less than or equal to max-wait-minutes.");
+  }
+
+  return {
+    stateFile: options.stateFile ?? ".activity-state.json",
+    symbols,
+    minTrades,
+    maxTrades,
+    sizeRange,
+    leverage,
+    minHoldMinutes,
+    maxHoldMinutes,
+    minWaitMinutes,
+    maxWaitMinutes,
+    limitProbability,
+    limitOffsetBps,
+    timezone
+  };
+}
+
+function buildDailyTradePlan(settings: DailyCycleSettings): PlannedDailyTrade[] {
+  const tradeCount = randomInt(settings.minTrades, settings.maxTrades);
+  const sides = buildDailySides(tradeCount);
+  const orderTypes = buildDailyOrderTypes(tradeCount, settings.limitProbability);
+  const symbols = buildDailySymbols(tradeCount, settings.symbols);
+
+  return Array.from({ length: tradeCount }, (_, index) => ({
+    index: index + 1,
+    side: sides[index],
+    symbol: symbols[index],
+    sizeOrPercent: drawPercentSizingInput(settings.sizeRange),
+    orderType: orderTypes[index],
+    holdMs: randomInt(settings.minHoldMinutes, settings.maxHoldMinutes) * 60_000,
+    waitBeforeMs: index === 0 ? 0 : randomInt(settings.minWaitMinutes, settings.maxWaitMinutes) * 60_000,
+    limitOffsetBps: orderTypes[index] === "limit" ? settings.limitOffsetBps : null
+  }));
+}
+
+function buildDailySides(tradeCount: number): Array<"buy" | "sell"> {
+  if (tradeCount === 1) {
+    return [Math.random() >= 0.5 ? "buy" : "sell"];
+  }
+
+  const sides: Array<"buy" | "sell"> = ["buy", "sell"];
+
+  while (sides.length < tradeCount) {
+    sides.push(Math.random() >= 0.5 ? "buy" : "sell");
+  }
+
+  return shuffleArray(sides);
+}
+
+function buildDailyOrderTypes(tradeCount: number, limitProbability: number): Array<"market" | "limit"> {
+  if (tradeCount === 1) {
+    return [Math.random() * 100 < limitProbability ? "limit" : "market"];
+  }
+
+  const orderTypes: Array<"market" | "limit"> = ["market", "limit"];
+
+  while (orderTypes.length < tradeCount) {
+    orderTypes.push(Math.random() * 100 < limitProbability ? "limit" : "market");
+  }
+
+  return shuffleArray(orderTypes);
+}
+
+function buildDailySymbols(tradeCount: number, symbols: string[]): string[] {
+  if (symbols.length === 1) {
+    return new Array<string>(tradeCount).fill(symbols[0]);
+  }
+
+  const ordered = shuffleArray(symbols);
+  const selected: string[] = [];
+
+  for (let index = 0; index < tradeCount; index += 1) {
+    const previous = selected.at(-1);
+    const candidates = ordered.filter((symbol) => symbol !== previous);
+    const source = candidates.length > 0 ? candidates : ordered;
+    selected.push(source[index % source.length]);
+  }
+
+  return selected;
+}
+
+async function executeDailyTrade(
+  api: BulkApiClient,
+  config: EnvConfig,
+  identity: TradingIdentity,
+  exchangeInfo: ExchangeSymbolInfo[],
+  trade: PlannedDailyTrade,
+  leverage: string
+): Promise<Record<string, unknown>> {
+  await cleanupSymbolState(api, identity, trade.symbol);
+  await ensureLeverage(api, config, identity, trade.symbol, exchangeInfo, leverage);
+
+  const account = await api.getFullAccount(identity.accountAddress);
+  const size = await resolveOrderSize({
+    api,
+    symbol: trade.symbol,
+    sizeOrPercent: trade.sizeOrPercent,
+    exchangeInfo,
+    account,
+    leverageOverride: leverage
+  });
+
+  let actualOrderType: "market" | "limit" | "limit_fallback_market" = trade.orderType;
+  let limitPrice: number | null = null;
+  let openStatuses: Array<Record<string, unknown>>;
+
+  if (trade.orderType === "limit") {
+    const symbolInfo = exchangeInfo.find((item) => item.symbol === trade.symbol);
+
+    if (!symbolInfo) {
+      throw new Error(`Unknown symbol in daily cycle: ${trade.symbol}`);
+    }
+
+    const referencePrice = size.referencePrice ?? await api.getReferencePrice(trade.symbol);
+    limitPrice = computeAggressiveLimitPrice(referencePrice, trade.side, trade.limitOffsetBps ?? 0, symbolInfo.tickSize);
+    const limitResponse = await api.submit(signOrderActions({
+      account: identity.accountAddress,
+      signerKeypair: identity.keypair,
+      nonce: nextNonce(),
+      actions: [
+        {
+          l: {
+            c: trade.symbol,
+            b: trade.side === "buy",
+            px: limitPrice,
+            sz: size.size,
+            tif: "GTC",
+            r: false
+          }
+        }
+      ]
+    }));
+    openStatuses = ensureAcceptedStatuses(limitResponse, `${trade.side} ${trade.symbol} limit`);
+
+    const filledPosition = await waitForPosition(api, identity.accountAddress, trade.symbol, 20_000);
+
+    if (!filledPosition || Math.abs(filledPosition.size) <= 0) {
+      await cancelAllOrdersForSymbols(api, identity, [trade.symbol]);
+      const fallbackResponse = await api.submit(signOrderActions({
+        account: identity.accountAddress,
+        signerKeypair: identity.keypair,
+        nonce: nextNonce(),
+        actions: [
+          {
+            m: {
+              c: trade.symbol,
+              b: trade.side === "buy",
+              sz: size.size,
+              r: false
+            }
+          }
+        ]
+      }));
+      openStatuses = [...openStatuses, ...ensureAcceptedStatuses(fallbackResponse, `${trade.side} ${trade.symbol} market fallback`)];
+      actualOrderType = "limit_fallback_market";
+    }
+  } else {
+    const response = await api.submit(signOrderActions({
+      account: identity.accountAddress,
+      signerKeypair: identity.keypair,
+      nonce: nextNonce(),
+      actions: [
+        {
+          m: {
+            c: trade.symbol,
+            b: trade.side === "buy",
+            sz: size.size,
+            r: false
+          }
+        }
+      ]
+    }));
+    openStatuses = ensureAcceptedStatuses(response, `${trade.side} ${trade.symbol} market`);
+  }
+
+  const openedPosition = await waitForPosition(api, identity.accountAddress, trade.symbol, 20_000);
+
+  if (!openedPosition || Math.abs(openedPosition.size) <= 0) {
+    throw new Error(`Failed to observe an open position for ${trade.symbol}.`);
+  }
+
+  console.log(`[daily-cycle] holding ${trade.symbol} for ${trade.holdMs}ms`);
+  await sleep(trade.holdMs);
+
+  const closeResult = await closeSymbolForIdentity(api, identity, trade.symbol);
+  await cancelAllOrdersForSymbols(api, identity, [trade.symbol]);
+  const closed = await waitForClosedPosition(api, identity.accountAddress, trade.symbol, 20_000);
+
+  return {
+    index: trade.index,
+    symbol: trade.symbol,
+    side: trade.side,
+    requested: trade.sizeOrPercent,
+    openedSize: Math.abs(openedPosition.size),
+    requestedSize: size.size,
+    sizingMode: size.mode,
+    leverage: size.leverage,
+    estimatedNotional: size.estimatedNotional,
+    estimatedMarginUsed: size.estimatedMarginUsed,
+    orderTypeRequested: trade.orderType,
+    orderTypeExecuted: actualOrderType,
+    limitPrice,
+    holdMinutes: Math.round(trade.holdMs / 60_000),
+    openStatuses,
+    closeStatuses: closeResult.statuses,
+    closed: closed
+  };
+}
+
+async function cleanupSymbolState(
+  api: BulkApiClient,
+  identity: TradingIdentity,
+  symbol: string
+): Promise<void> {
+  const account = await api.getFullAccount(identity.accountAddress);
+  const hasOpenOrders = account.openOrders.some((item) => item.symbol === symbol);
+  const position = account.positions.find((item) => getPositionSymbol(item) === symbol);
+
+  if (hasOpenOrders) {
+    await cancelAllOrdersForSymbols(api, identity, [symbol]);
+  }
+
+  if (position && Math.abs(position.size) > 0) {
+    await closeSymbolForIdentity(api, identity, symbol);
+    await waitForClosedPosition(api, identity.accountAddress, symbol, 20_000);
+  }
+}
+
+async function closeSymbolForIdentity(
+  api: BulkApiClient,
+  identity: TradingIdentity,
+  symbol: string
+): Promise<{ statuses: Array<Record<string, unknown>>; closedSize: number }> {
+  const account = await api.getFullAccount(identity.accountAddress);
+  const position = account.positions.find((item) => getPositionSymbol(item) === symbol);
+
+  if (!position || Math.abs(position.size) <= 0) {
+    return {
+      statuses: [],
+      closedSize: 0
+    };
+  }
+
+  const response = await api.submit(signOrderActions({
+    account: identity.accountAddress,
+    signerKeypair: identity.keypair,
+    nonce: nextNonce(),
+    actions: [
+      {
+        m: {
+          c: symbol,
+          b: position.size < 0,
+          sz: Math.abs(position.size),
+          r: true
+        }
+      }
+    ]
+  }));
+
+  return {
+    statuses: ensureAcceptedStatuses(response, `close ${symbol}`),
+    closedSize: Math.abs(position.size)
+  };
+}
+
+async function cancelAllOrdersForSymbols(
+  api: BulkApiClient,
+  identity: TradingIdentity,
+  symbols: string[]
+): Promise<Array<Record<string, unknown>>> {
+  const uniqueSymbols = Array.from(new Set(symbols.filter(Boolean)));
+
+  if (uniqueSymbols.length === 0) {
+    return [];
+  }
+
+  const response = await api.submit(signOrderActions({
+    account: identity.accountAddress,
+    signerKeypair: identity.keypair,
+    nonce: nextNonce(),
+    actions: [
+      {
+        cxa: {
+          c: uniqueSymbols
+        }
+      }
+    ]
+  }));
+
+  return ensureAcceptedStatuses(response, `cancel all ${uniqueSymbols.join(",")}`);
+}
+
+async function waitForPosition(
+  api: BulkApiClient,
+  accountAddress: string,
+  symbol: string,
+  timeoutMs: number
+): Promise<Position | null> {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt <= timeoutMs) {
+    const account = await api.getFullAccount(accountAddress);
+    const position = account.positions.find((item) => getPositionSymbol(item) === symbol);
+
+    if (position && Math.abs(position.size) > 0) {
+      return position;
+    }
+
+    await sleep(2_000);
+  }
+
+  return null;
+}
+
+async function waitForClosedPosition(
+  api: BulkApiClient,
+  accountAddress: string,
+  symbol: string,
+  timeoutMs: number
+): Promise<boolean> {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt <= timeoutMs) {
+    const account = await api.getFullAccount(accountAddress);
+    const position = account.positions.find((item) => getPositionSymbol(item) === symbol);
+    const stillOpenOrders = account.openOrders.some((item) => item.symbol === symbol);
+
+    if ((!position || Math.abs(position.size) === 0) && !stillOpenOrders) {
+      return true;
+    }
+
+    await sleep(2_000);
+  }
+
+  return false;
+}
+
+function computeAggressiveLimitPrice(
+  referencePrice: number,
+  side: "buy" | "sell",
+  offsetBps: number,
+  tickSize: number
+): number {
+  const rawPrice = side === "buy"
+    ? referencePrice * (1 + offsetBps / 10_000)
+    : referencePrice * (1 - offsetBps / 10_000);
+
+  return roundToNearestStep(rawPrice, tickSize);
+}
+
+function roundToNearestStep(value: number, step: number): number {
+  if (!Number.isFinite(value) || !Number.isFinite(step) || step <= 0) {
+    return value;
+  }
+
+  const rounded = Math.round(value / step) * step;
+  const precision = countDecimals(step);
+  return Number(rounded.toFixed(precision));
+}
+
+function parseDailySymbols(raw: string, exchangeInfo: ExchangeSymbolInfo[]): string[] {
+  const supported = new Set(exchangeInfo.map((item) => item.symbol));
+  const symbols = raw
+    .split(",")
+    .map((item) => normalizeSymbol(item))
+    .filter(Boolean);
+
+  if (symbols.length === 0) {
+    fail("symbols must contain at least one market symbol.");
+  }
+
+  for (const symbol of symbols) {
+    if (!supported.has(symbol)) {
+      fail(`Unknown daily-cycle symbol: ${symbol}`);
+    }
+  }
+
+  return Array.from(new Set(symbols));
+}
+
+function parsePositiveIntegerOption(raw: string, label: string): number {
+  const value = Number(raw);
+
+  if (!Number.isFinite(value) || value <= 0 || !Number.isInteger(value)) {
+    fail(`${label} must be a positive integer.`);
+  }
+
+  return value;
+}
+
+function parsePercentageOption(raw: string, label: string): number {
+  const value = Number(raw);
+
+  if (!Number.isFinite(value) || value < 0 || value > 100) {
+    fail(`${label} must be between 0 and 100.`);
+  }
+
+  return value;
+}
+
+function normalizePercentSizingInput(raw: string): string {
+  const trimmed = raw.trim();
+
+  if (!trimmed) {
+    fail("size-range cannot be empty.");
+  }
+
+  const percent = resolvePercentInput(trimmed);
+
+  if (percent === null) {
+    fail("size-range must be a percent like 20% or a range like 12-28%.");
+  }
+
+  return trimmed.includes("-")
+    ? trimmed.replace(/\s+/g, "")
+    : `${percent}%`;
+}
+
+function drawPercentSizingInput(raw: string): string {
+  if (!raw.includes("-")) {
+    return raw;
+  }
+
+  const match = raw.match(/^(\d+(?:\.\d+)?)%?\s*-\s*(\d+(?:\.\d+)?)%$/);
+
+  if (!match) {
+    return raw;
+  }
+
+  return `${randomPercentInRange(Number(match[1]), Number(match[2]))}%`;
+}
+
+function shuffleArray<T>(items: T[]): T[] {
+  const result = [...items];
+
+  for (let index = result.length - 1; index > 0; index -= 1) {
+    const swapIndex = Math.floor(Math.random() * (index + 1));
+    [result[index], result[swapIndex]] = [result[swapIndex], result[index]];
+  }
+
+  return result;
+}
+
+function markAccountActiveDay(
+  accountState: {
+    lastActiveDate?: string;
+    activeDaysStreak: number;
+  },
+  localDate: string
+): void {
+  if (accountState.lastActiveDate === localDate) {
+    return;
+  }
+
+  if (accountState.lastActiveDate && getPreviousDateString(localDate) === accountState.lastActiveDate) {
+    accountState.activeDaysStreak += 1;
+  } else {
+    accountState.activeDaysStreak = 1;
+  }
+
+  accountState.lastActiveDate = localDate;
+}
+
+function getLocalDateString(date: Date, timeZone: string): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(date);
+
+  const year = parts.find((part) => part.type === "year")?.value;
+  const month = parts.find((part) => part.type === "month")?.value;
+  const day = parts.find((part) => part.type === "day")?.value;
+
+  if (!year || !month || !day) {
+    fail(`Failed to resolve local date for timezone ${timeZone}.`);
+  }
+
+  return `${year}-${month}-${day}`;
+}
+
+function getPreviousDateString(dateText: string): string {
+  const match = dateText.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+
+  if (!match) {
+    fail(`Invalid local date string: ${dateText}`);
+  }
+
+  const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])));
+  date.setUTCDate(date.getUTCDate() - 1);
+
+  return date.toISOString().slice(0, 10);
 }
 
 async function connectWalletProfile(
