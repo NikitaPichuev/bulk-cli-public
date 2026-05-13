@@ -49,6 +49,13 @@ export function normalizeProxyUrlInput(proxyUrl?: string | null): string | null 
     return trimmed;
   }
 
+  const hostPortCredentialsMatch = trimmed.match(/^([^:@\/\s]+:\d+)@([^:@\/\s]+):(.+)$/);
+
+  if (hostPortCredentialsMatch) {
+    const [, hostPort, username, password] = hostPortCredentialsMatch;
+    return `http://${encodeURIComponent(username)}:${encodeURIComponent(password)}@${hostPort}`;
+  }
+
   return `http://${trimmed}`;
 }
 

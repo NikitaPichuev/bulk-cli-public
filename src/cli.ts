@@ -3,17 +3,18 @@ import fs from "fs";
 import { Command } from "commander";
 
 import { getOrCreateAccountActivity, loadActivityState, resolveActivityStateFile, saveActivityState, type ActivityRunRecord, type ActivityStateFile } from "./activityState";
-import { BulkApiClient, ensureAcceptedStatuses } from "./bulkApi";
+import { BulkApiClient, ensureAcceptedStatuses, extractStatuses } from "./bulkApi";
 import { loadConfig, upsertEnvFile } from "./config";
-import { signAgentWalletAction, signFaucetAction, signOrderActions, signUserSettingsAction } from "./manualSigning";
-import { createKeypair, loadKeypair, nextNonce } from "./nativeBulk";
+import { createKeypair, createSigner, decodeEnvelope, decodeEnvelopeArray, loadKeypair, nextNonce, type NativeKeypair } from "./nativeBulk";
 import { configureNetworking, getVisibleIp, normalizeProxyUrlInput } from "./network";
-import type { EnvConfig, ExchangeSymbolInfo, FullAccountState, OrderTimeInForce, Position, WalletProfile } from "./types";
+import { submitSdkActions } from "./sdkBridge";
+import type { ActionEnvelope, EnvConfig, ExchangeSymbolInfo, FullAccountState, OrderTimeInForce, Position, WalletProfile } from "./types";
 import { loadProxyLines, loadWalletProfiles, resolveWalletFile, saveWalletProfiles } from "./walletProfiles";
 
 interface TradingIdentity {
   accountAddress: string;
   keypair: ReturnType<typeof loadKeypair>;
+  ownerKeypair?: ReturnType<typeof loadKeypair>;
 }
 
 interface ResolvedOrderSize {
@@ -70,7 +71,7 @@ interface DailyCycleSettings {
   minTrades: number;
   maxTrades: number;
   sizeRange: string;
-  leverage: string;
+  leverageRange: string;
   minHoldMinutes: number;
   maxHoldMinutes: number;
   minWaitMinutes: number;
@@ -85,6 +86,7 @@ interface PlannedDailyTrade {
   side: "buy" | "sell";
   symbol: string;
   sizeOrPercent: string;
+  leverage: string;
   orderType: "market" | "limit";
   holdMs: number;
   waitBeforeMs: number;
@@ -185,6 +187,11 @@ const BATCH_CONNECT_RETRY_DELAY_MAX_MS = 5_000;
 const TEST_FUNDS_CLAIM_ATTEMPTS = 2;
 const TEST_FUNDS_BALANCE_POLL_ATTEMPTS = 4;
 const TEST_FUNDS_BALANCE_POLL_DELAY_MS = 1_500;
+const POSITION_OBSERVE_TIMEOUT_MS = 60_000;
+const POSITION_CLOSE_TIMEOUT_MS = 60_000;
+const ORDER_NOTIONAL_BUFFER = 1.01;
+const ORDER_MIN_TARGET_NOTIONAL = 1000;
+const ORDER_RISK_TARGET_NOTIONAL = 5000;
 
 interface TestFundsResult {
   faucetRequested: boolean;
@@ -240,13 +247,18 @@ program
         ? existingAgentKeypair
         : createKeypair();
 
-    const authResponse = await api.submit(signAgentWalletAction({
-      account: ownerKeypair.pubkey,
-      signerKeypair: ownerKeypair,
-      nonce: nextNonce(),
-      agentPubkey: agentKeypair.pubkey,
-      deleteFlag: false
-    }));
+    const authResponse = submitSdkActions(
+      api,
+      ownerKeypair,
+      ownerKeypair.pubkey,
+      [{
+        agentWalletCreation: {
+          a: agentKeypair.pubkey,
+          d: false
+        }
+      }],
+      nextNonce()
+    );
     try {
       ensureAcceptedStatuses(authResponse, "agent wallet registration");
     } catch (error) {
@@ -258,12 +270,17 @@ program
 
     if (!options.skipMaxLeverage) {
       const exchangeInfo = await api.getExchangeInfo();
-      const settingsResponse = await api.submit(signUserSettingsAction({
-        account: ownerKeypair.pubkey,
-        signerKeypair: ownerKeypair,
-        nonce: nextNonce(),
-        leverageMap: Object.fromEntries(exchangeInfo.map((item) => [item.symbol, item.maxLeverage]))
-      }));
+      const settingsResponse = submitSdkActions(
+        api,
+        ownerKeypair,
+        ownerKeypair.pubkey,
+        [{
+          updateUserSettings: {
+            m: Object.fromEntries(exchangeInfo.map((item) => [item.symbol, item.maxLeverage]))
+          }
+        }],
+        nextNonce()
+      );
       ensureAcceptedStatuses(settingsResponse, "max leverage setup");
     }
 
@@ -355,11 +372,11 @@ program
       return;
     }
 
-    const response = await api.submit(signOrderActions({
-      account: identity.accountAddress,
-      signerKeypair: identity.keypair,
-      nonce: nextNonce(),
-      actions: [
+    const response = submitSdkActions(
+      api,
+      identity.keypair,
+      identity.accountAddress,
+      [
         {
           m: {
             c: normalizedSymbol,
@@ -368,8 +385,9 @@ program
             r: true
           }
         }
-      ]
-    }));
+      ],
+      nextNonce()
+    );
 
     console.log(JSON.stringify({
       ok: true,
@@ -428,16 +446,16 @@ program
   .command("daily-cycle")
   .description("Run a randomized daily trading routine for the configured account and track active days")
   .option("--state-file <path>", "Local JSON state file for faucet/activity tracking", ".activity-state.json")
-  .option("--symbols <list>", "Comma-separated symbols, for example BTC,ETH,SOL", "BTC,ETH,SOL")
+  .option("--symbols <list>", "Comma-separated symbols, for example BTC,ETH", "BTC,ETH")
   .option("--min-trades <count>", "Minimum number of trades in this run", "3")
   .option("--max-trades <count>", "Maximum number of trades in this run", "8")
-  .option("--size-range <range>", "Percent range per trade, for example 12-28%", "12-28%")
-  .option("--leverage <value>", "Leverage to set before routine trades", "2")
+  .option("--size-range <range>", "Percent range per trade, for example 20-40%", "20-40%")
+  .option("--leverage <value>", "Leverage to set before routine trades", "5-10")
   .option("--min-hold-minutes <minutes>", "Minimum hold time per position", "5")
   .option("--max-hold-minutes <minutes>", "Maximum hold time per position", "30")
   .option("--min-wait-minutes <minutes>", "Minimum wait between trades", "15")
   .option("--max-wait-minutes <minutes>", "Maximum wait between trades", "90")
-  .option("--limit-probability <percent>", "How often to use limit orders instead of market orders", "40")
+  .option("--limit-probability <percent>", "How often to use limit orders instead of market orders", "0")
   .option("--limit-offset-bps <bps>", "Aggressive limit offset in basis points", "8")
   .option("--dry-run", "Print the planned routine without sending orders", false)
   .action(async (options: DailyCycleCommandOptions) => {
@@ -449,27 +467,107 @@ program
   .description("Run the randomized daily trading routine for a batch wallet file")
   .option("--file <path>", "Wallets JSON file", ".wallets.json")
   .option("--proxies-file <path>", "Optional proxies text file, one proxy per line", ".proxies.txt")
-  .option("--delay-ms <ms>", "Base delay between wallets in milliseconds", "5000")
-  .option("--jitter-ms <ms>", "Random extra delay between wallets in milliseconds", "5000")
+  .option("--delay-ms <ms>", "Base delay between wallets in milliseconds", "3000")
+  .option("--jitter-ms <ms>", "Random extra delay between wallets in milliseconds", "7000")
   .option("--concurrency <count>", "How many wallets to process in parallel", "3")
   .option("--wallets <list>", "Comma-separated wallet names to include, for example wallet-1,wallet-7")
   .option("--max-wallets <count>", "Maximum number of wallets to process in this run")
   .option("--shuffle-wallets", "Shuffle wallet order before applying max-wallets", false)
   .option("--state-file <path>", "Local JSON state file for faucet/activity tracking", ".activity-state.json")
-  .option("--symbols <list>", "Comma-separated symbols, for example BTC,ETH,SOL", "BTC,ETH,SOL")
+  .option("--symbols <list>", "Comma-separated symbols, for example BTC,ETH", "BTC,ETH")
   .option("--min-trades <count>", "Minimum number of trades in this run", "3")
   .option("--max-trades <count>", "Maximum number of trades in this run", "8")
-  .option("--size-range <range>", "Percent range per trade, for example 12-28%", "12-28%")
-  .option("--leverage <value>", "Leverage to set before routine trades", "2")
+  .option("--size-range <range>", "Percent range per trade, for example 20-40%", "20-40%")
+  .option("--leverage <value>", "Leverage to set before routine trades", "5-10")
   .option("--min-hold-minutes <minutes>", "Minimum hold time per position", "5")
   .option("--max-hold-minutes <minutes>", "Maximum hold time per position", "30")
   .option("--min-wait-minutes <minutes>", "Minimum wait between trades", "15")
   .option("--max-wait-minutes <minutes>", "Maximum wait between trades", "90")
-  .option("--limit-probability <percent>", "How often to use limit orders instead of market orders", "40")
+  .option("--limit-probability <percent>", "How often to use limit orders instead of market orders", "0")
   .option("--limit-offset-bps <bps>", "Aggressive limit offset in basis points", "8")
   .option("--dry-run", "Print the planned routines without sending orders", false)
   .action(async (options: BatchDailyCycleCommandOptions) => {
     await runBatchDailyCycle(options);
+  });
+
+program
+  .command("batch-faucet")
+  .description("Request faucet for wallets from a JSON wallet file without registering agent wallets")
+  .option("--file <path>", "Wallets JSON file", ".wallets.json")
+  .option("--proxies-file <path>", "Optional proxies text file, one proxy per line", ".proxies.txt")
+  .option("--delay-ms <ms>", "Base delay between wallets in milliseconds", "5000")
+  .option("--jitter-ms <ms>", "Random extra delay between wallets in milliseconds", "5000")
+  .option("--dry-run", "Show schedule without sending requests", false)
+  .action(async (options: BatchCommandOptions) => {
+    const config = loadConfig();
+    configureNetworking(config);
+    const filePath = resolveWalletFile(options.file ?? ".wallets.json");
+    const profiles = loadWalletProfiles(filePath).filter((item) => item.enabled !== false);
+    const proxies = resolveBatchProxies(options, profiles.length);
+    const plan = getBatchPlan(profiles.length, options.delayMs, options.jitterMs);
+    const results: Array<Record<string, unknown>> = [];
+
+    console.log(`[batch-faucet] wallets=${profiles.length}, file=${filePath}`);
+
+    for (let index = 0; index < profiles.length; index += 1) {
+      const profile = profiles[index];
+      const proxyUrl = proxies[index];
+      logBatchProgress("faucet", index, profiles.length, profile.name, plan[index]);
+
+      const ownerKeypair = loadKeypair(profile.ownerSecretKey);
+
+      if (options.dryRun) {
+        results.push({
+          name: profile.name,
+          account: ownerKeypair.pubkey,
+          scheduledAfterMs: plan[index],
+          action: "faucet"
+        });
+        continue;
+      }
+
+      if (plan[index] > 0) {
+        await sleep(plan[index]);
+      }
+
+      try {
+        const testFunds = await retryBatchConnect(profile.name, async (attempt) => {
+          if (attempt > 1) {
+            console.log(`[faucet retry ${attempt}/${BATCH_CONNECT_RETRY_ATTEMPTS}] ${profile.name}`);
+          }
+
+          const walletApi = new BulkApiClient(config.apiBaseUrl, proxyUrl ?? config.proxyUrl);
+          return await ensureTestFundsReady(walletApi, ownerKeypair, false, ownerKeypair.pubkey);
+        }, "faucet");
+
+        results.push({
+          ok: true,
+          name: profile.name,
+          account: ownerKeypair.pubkey,
+          testFunds,
+          proxyUsed: maskProxyUrl(proxyUrl ?? config.proxyUrl),
+          scheduledAfterMs: plan[index]
+        });
+        console.log(`[faucet ok] ${profile.name} -> ${ownerKeypair.pubkey}`);
+      } catch (error) {
+        results.push({
+          ok: false,
+          name: profile.name,
+          account: ownerKeypair.pubkey,
+          proxyUsed: maskProxyUrl(proxyUrl ?? config.proxyUrl),
+          scheduledAfterMs: plan[index],
+          error: formatError(error)
+        });
+        console.log(`[faucet error] ${profile.name}: ${formatError(error)}`);
+      }
+    }
+
+    const failed = results.some((item) => item.ok === false);
+    console.log(JSON.stringify({
+      ok: !failed,
+      file: filePath,
+      wallets: results
+    }, null, 2));
   });
 
 program
@@ -711,11 +809,11 @@ async function submitOrder(input: {
     fail("Limit order requires a positive `--price`.");
   }
 
-  const response = await api.submit(signOrderActions({
-    account: identity.accountAddress,
-    signerKeypair: identity.keypair,
-    nonce: nextNonce(),
-    actions: [
+  const response = submitSdkActions(
+    api,
+    identity.keypair,
+    identity.accountAddress,
+    [
       isLimit
         ? {
             l: {
@@ -735,8 +833,9 @@ async function submitOrder(input: {
               r: false
             }
           }
-    ]
-  }));
+    ],
+    nextNonce()
+  );
 
   console.log(JSON.stringify({
     ok: true,
@@ -772,14 +871,135 @@ async function ensureLeverage(
     return;
   }
 
-  const response = await api.submit(signUserSettingsAction({
-    account: identity.accountAddress,
-    signerKeypair: identity.keypair,
-    nonce: nextNonce(),
-    leverageMap: { [symbol]: desired }
-  }));
+  const response = submitSdkActions(
+    api,
+    identity.keypair,
+    identity.accountAddress,
+    [{
+      updateUserSettings: {
+        m: { [symbol]: desired }
+      }
+    }],
+    nextNonce()
+  );
 
-  ensureAcceptedStatuses(response, `set leverage for ${symbol}`);
+  try {
+    ensureAcceptedStatuses(response, `set leverage for ${symbol}`);
+  } catch (error) {
+    if (isBadSignatureError(error)) {
+      console.log(`[daily-cycle warn] set leverage for ${symbol} skipped after bad signature; continuing with existing leverage=${existing ?? "unknown"}`);
+      return;
+    }
+
+    throw error;
+  }
+}
+
+function signNativeAgentWalletAction(params: {
+  account: string;
+  signerKeypair: NativeKeypair;
+  nonce: number;
+  agentPubkey: string;
+  deleteFlag: boolean;
+}): ActionEnvelope {
+  return decodeEnvelope(createSigner(params.signerKeypair).signAgentWallet(
+    params.agentPubkey,
+    params.deleteFlag,
+    params.nonce,
+    params.account
+  ));
+}
+
+function signNativeUserSettingsAction(params: {
+  account: string;
+  signerKeypair: NativeKeypair;
+  nonce: number;
+  leverageMap: Record<string, number>;
+}): ActionEnvelope {
+  return decodeEnvelope(createSigner(params.signerKeypair).signUserSettings(
+    Object.entries(params.leverageMap).map(([symbol, leverage]) => ({ symbol, leverage })),
+    params.nonce,
+    params.account
+  ));
+}
+
+function signNativeFaucetAction(params: {
+  account: string;
+  signerKeypair: NativeKeypair;
+  nonce: number;
+  amount?: number;
+}): ActionEnvelope {
+  return decodeEnvelope(createSigner(params.signerKeypair).signFaucet(
+    params.nonce,
+    params.amount ?? null,
+    params.account
+  ));
+}
+
+function signOrderActions(params: {
+  account: string;
+  signerKeypair: NativeKeypair;
+  nonce: number;
+  actions: Array<Record<string, unknown>>;
+}): ActionEnvelope {
+  const envelopes = decodeEnvelopeArray(createSigner(params.signerKeypair).signAll(
+    params.actions.map(toNativeSignAction),
+    params.nonce,
+    params.account
+  ));
+
+  if (envelopes.length !== 1) {
+    throw new Error(`Unexpected native signer envelope count: ${envelopes.length}`);
+  }
+
+  return envelopes[0];
+}
+
+function toNativeSignAction(action: Record<string, unknown>): Record<string, unknown> {
+  if (action.type) {
+    return action;
+  }
+
+  const market = action.m as Record<string, unknown> | undefined;
+  if (market) {
+    return {
+      type: "order",
+      symbol: market.c,
+      isBuy: market.b,
+      size: market.sz,
+      reduceOnly: market.r ?? false,
+      price: 0,
+      orderType: {
+        type: "market"
+      }
+    };
+  }
+
+  const limit = action.l as Record<string, unknown> | undefined;
+  if (limit) {
+    return {
+      type: "order",
+      symbol: limit.c,
+      isBuy: limit.b,
+      size: limit.sz,
+      reduceOnly: limit.r ?? false,
+      price: limit.px,
+      orderType: {
+        type: "limit",
+        tif: limit.tif ?? "GTC"
+      }
+    };
+  }
+
+  const cancelAll = action.cxa as Record<string, unknown> | undefined;
+  if (cancelAll) {
+    return {
+      type: "cancelAll",
+      symbols: cancelAll.c
+    };
+  }
+
+  throw new Error(`Unsupported action for native signing: ${JSON.stringify(action)}`);
 }
 
 async function resolveOrderSize(input: {
@@ -844,10 +1064,20 @@ async function resolveOrderSize(input: {
   }
 
   const referencePrice = await input.api.getReferencePrice(input.symbol);
-  const marginBudget = availableBalance * (percent / 100);
-  const estimatedNotional = marginBudget * leverage * MARKET_ORDER_SAFETY_FACTOR;
+  const requestedMarginBudget = availableBalance * (percent / 100);
+  const requestedNotional = requestedMarginBudget * leverage * MARKET_ORDER_SAFETY_FACTOR;
+  const minimumTradableNotional = Math.max(symbolInfo.minNotional * ORDER_NOTIONAL_BUFFER, ORDER_MIN_TARGET_NOTIONAL);
+  if (minimumTradableNotional > ORDER_RISK_TARGET_NOTIONAL) {
+    fail(`${input.symbol} min notional ${symbolInfo.minNotional} is above risk target ${ORDER_RISK_TARGET_NOTIONAL}.`);
+  }
+  const estimatedNotional = Math.min(requestedNotional, ORDER_RISK_TARGET_NOTIONAL);
+  const marginBudget = estimatedNotional / leverage;
   const rawSize = estimatedNotional / referencePrice;
-  const size = roundDownToStep(rawSize, symbolInfo.lotSize);
+  let size = roundDownToStep(rawSize, symbolInfo.lotSize);
+
+  if (size * referencePrice < minimumTradableNotional) {
+    size = roundUpToStep(minimumTradableNotional / referencePrice, symbolInfo.lotSize);
+  }
 
   if (!Number.isFinite(size) || size <= 0) {
     fail(`Calculated size is too small for ${input.symbol}.`);
@@ -906,6 +1136,16 @@ function roundDownToStep(value: number, step: number): number {
   return Number(rounded.toFixed(precision));
 }
 
+function roundUpToStep(value: number, step: number): number {
+  if (!Number.isFinite(value) || !Number.isFinite(step) || step <= 0) {
+    return value;
+  }
+
+  const rounded = Math.ceil(value / step) * step;
+  const precision = countDecimals(step);
+  return Number(rounded.toFixed(precision));
+}
+
 function countDecimals(value: number): number {
   const asText = value.toString();
 
@@ -960,13 +1200,15 @@ function requireOwnerIdentity(config: EnvConfig): TradingIdentity {
 }
 
 function requireTradingIdentity(config: EnvConfig): TradingIdentity {
-  if (!config.accountAddress || !config.agentSecretKey) {
-    fail("Не найдены BULK_ACCOUNT_ADDRESS или BULK_AGENT_SECRET_KEY. Сначала выполни `connect`.");
+  if (!config.accountAddress || (!config.ownerSecretKey && !config.agentSecretKey)) {
+    fail("Не найдены BULK_ACCOUNT_ADDRESS и секрет для подписи. Заполни BULK_OWNER_SECRET_KEY или выполни `connect`.");
   }
 
+  const signerKeypair = loadKeypair(config.ownerSecretKey ?? config.agentSecretKey!);
   return {
     accountAddress: config.accountAddress,
-    keypair: loadKeypair(config.agentSecretKey)
+    keypair: signerKeypair,
+    ownerKeypair: config.ownerSecretKey ? loadKeypair(config.ownerSecretKey) : undefined
   };
 }
 
@@ -993,11 +1235,17 @@ async function ensureTestFundsReady(
 
   if (!skipFaucet) {
     for (let attempt = 1; attempt <= TEST_FUNDS_CLAIM_ATTEMPTS; attempt += 1) {
-      const faucetResponse = await api.submit(signFaucetAction({
-        account,
+      const faucetResponse = submitSdkActions(
+        api,
         signerKeypair,
-        nonce: nextNonce()
-      }));
+        account,
+        [{
+          faucet: {
+            u: account
+          }
+        }],
+        nextNonce()
+      );
 
       try {
         acceptFaucetStatuses(faucetResponse);
@@ -1212,72 +1460,92 @@ async function runBatchDailyCycle(options: BatchDailyCycleCommandOptions): Promi
 
   console.log(`[batch-daily-cycle] wallets=${selectedProfiles.length}, file=${filePath}, concurrency=${concurrency}`);
 
-  const results = await Promise.all(selectedProfiles.map(async (selected, index) => {
+  const tasks: Array<Promise<{ ok: boolean; [key: string]: unknown }>> = [];
+  let scheduledAfterMsTotal = 0;
+
+  for (let index = 0; index < selectedProfiles.length; index += 1) {
+    const selected = selectedProfiles[index];
     const profile = selected.profile;
     const proxyUrl = proxies[selected.originalIndex];
     const walletApi = new RateLimitedBulkApiClient(config.apiBaseUrl, semaphore, proxyUrl ?? config.proxyUrl);
+    const launchDelayMs = walletPlan[index];
 
-    logBatchProgress("daily-cycle", index, selectedProfiles.length, profile.name, walletPlan[index]);
+    logBatchProgress("daily-cycle", index, selectedProfiles.length, profile.name, launchDelayMs);
 
-    if (walletPlan[index] > 0 && !options.dryRun) {
-      await sleep(walletPlan[index]);
+    if (launchDelayMs > 0 && !options.dryRun) {
+      await sleep(launchDelayMs);
     }
 
-    if (!profile.accountAddress || !profile.agentSecretKey) {
-      console.log(`[batch-daily-cycle error] ${profile.name}: not connected`);
-      return {
-        ok: false,
-        name: profile.name,
-        account: profile.accountAddress,
-        proxyUsed: maskProxyUrl(proxyUrl ?? config.proxyUrl),
-        scheduledAfterMs: walletPlan[index],
-        error: `Wallet "${profile.name}" is not connected. Run batch-connect first.`
-      };
-    }
+    scheduledAfterMsTotal += launchDelayMs;
+    const scheduledAfterMs = scheduledAfterMsTotal;
 
-    const identity: TradingIdentity = {
-      accountAddress: profile.accountAddress,
-      keypair: loadKeypair(profile.agentSecretKey)
-    };
-
-    try {
-      const result = await runDailyCycleForIdentity({
-        api: walletApi,
-        config,
-        identity,
-        exchangeInfo,
-        settings,
-        dryRun: options.dryRun ?? false,
-        logPrefix: `${profile.name}/daily-cycle`,
-        activityState: sharedState
-      });
-
-      if ("activeDays" in result) {
-        console.log(`[batch-daily-cycle ok] ${profile.name} -> streak=${result.activeDays.streak}`);
-      } else {
-        console.log(`[batch-daily-cycle ok] ${profile.name} -> dry-run`);
+    const task = (async () => {
+      if (!profile.ownerSecretKey) {
+        console.log(`[batch-daily-cycle error] ${profile.name}: owner key missing`);
+        return {
+          ok: false,
+          name: profile.name,
+          account: profile.accountAddress,
+          proxyUsed: maskProxyUrl(proxyUrl ?? config.proxyUrl),
+          scheduledAfterMs,
+          launchDelayMs,
+          error: `Wallet "${profile.name}" has no owner key.`
+        };
       }
 
-      return {
-        ok: result.ok,
-        name: profile.name,
-        account: profile.accountAddress,
-        proxyUsed: maskProxyUrl(proxyUrl ?? config.proxyUrl),
-        scheduledAfterMs: walletPlan[index],
-        result
+      const ownerKeypair = loadKeypair(profile.ownerSecretKey);
+      const identity: TradingIdentity = {
+        accountAddress: profile.accountAddress ?? ownerKeypair.pubkey,
+        keypair: ownerKeypair,
+        ownerKeypair
       };
-    } catch (error) {
-      console.log(`[batch-daily-cycle error] ${profile.name}: ${formatError(error)}`);
-      return {
-        ok: false,
-        name: profile.name,
-        account: profile.accountAddress,
-        proxyUsed: maskProxyUrl(proxyUrl ?? config.proxyUrl),
-        scheduledAfterMs: walletPlan[index],
-        error: formatError(error)
-      };
-    }
-  }));
+
+      try {
+        const result = await runDailyCycleForIdentity({
+          api: walletApi,
+          config,
+          identity,
+          exchangeInfo,
+          settings,
+          dryRun: options.dryRun ?? false,
+          logPrefix: `${profile.name}/daily-cycle`,
+          activityState: sharedState
+        });
+
+        if ("activeDays" in result) {
+          const status = result.ok ? "ok" : "partial";
+          console.log(`[batch-daily-cycle ${status}] ${profile.name} -> streak=${result.activeDays.streak}`);
+        } else {
+          console.log(`[batch-daily-cycle ok] ${profile.name} -> dry-run`);
+        }
+
+        return {
+          ok: result.ok,
+          name: profile.name,
+          account: profile.accountAddress,
+          proxyUsed: maskProxyUrl(proxyUrl ?? config.proxyUrl),
+          scheduledAfterMs,
+          launchDelayMs,
+          result
+        };
+      } catch (error) {
+        console.log(`[batch-daily-cycle error] ${profile.name}: ${formatError(error)}`);
+        return {
+          ok: false,
+          name: profile.name,
+          account: profile.accountAddress,
+          proxyUsed: maskProxyUrl(proxyUrl ?? config.proxyUrl),
+          scheduledAfterMs,
+          launchDelayMs,
+          error: formatError(error)
+        };
+      }
+    })();
+
+    tasks.push(task);
+  }
+
+  const results = await Promise.all(tasks);
 
   console.log(JSON.stringify({
     ok: results.every((item) => item.ok === true),
@@ -1319,6 +1587,7 @@ async function runDailyCycleForIdentity(input: {
         symbol: trade.symbol,
         side: trade.side,
         sizeOrPercent: trade.sizeOrPercent,
+        leverage: trade.leverage,
         orderType: trade.orderType,
         holdMinutes: Math.round(trade.holdMs / 60_000),
         waitBeforeMinutes: Math.round(trade.waitBeforeMs / 60_000),
@@ -1340,9 +1609,19 @@ async function runDailyCycleForIdentity(input: {
 
   if (accountState.lastFaucetAttemptDate !== localDate) {
     console.log(`[${input.logPrefix}] faucet check starting`);
-    const testFunds = await ensureTestFundsReady(input.api, input.identity.keypair, false, input.identity.accountAddress);
     accountState.lastFaucetAttemptDate = localDate;
-    runRecord.faucetStatus = testFunds.faucetStatus;
+    try {
+      const faucetKeypair = input.identity.ownerKeypair ?? input.identity.keypair;
+      const testFunds = await ensureTestFundsReady(input.api, faucetKeypair, false, input.identity.accountAddress);
+      runRecord.faucetStatus = testFunds.faucetStatus;
+    } catch (error) {
+      if (!isFaucetAuthError(error)) {
+        throw error;
+      }
+
+      runRecord.faucetStatus = "skipped_auth_error";
+      console.log(`[${input.logPrefix} warn] faucet skipped after auth error: ${formatError(error)}`);
+    }
     saveActivityState(statePath, state);
   } else {
     runRecord.faucetStatus = "skipped_same_day";
@@ -1356,8 +1635,20 @@ async function runDailyCycleForIdentity(input: {
     }
 
     try {
-      console.log(`[${input.logPrefix}] trade ${trade.index}/${plan.length}: ${trade.side} ${trade.symbol} ${trade.sizeOrPercent} (${trade.orderType})`);
-      const result = await executeDailyTrade(input.api, input.config, input.identity, input.exchangeInfo, trade, input.settings.leverage);
+      console.log(`[${input.logPrefix}] trade ${trade.index}/${plan.length}: ${trade.side} ${trade.symbol} ${trade.sizeOrPercent} x${trade.leverage} (${trade.orderType})`);
+      const result = await executeDailyTrade(input.api, input.config, input.identity, input.exchangeInfo, trade);
+      if (result.opened === false) {
+        summaryTrades.push({
+          ok: true,
+          skipped: true,
+          skipReason: "no_open_position",
+          ...result
+        });
+        console.log(`[${input.logPrefix} warn] trade ${trade.index} skipped: ${result.skippedReason ?? `No open position observed for ${trade.symbol}`}`);
+        saveActivityState(statePath, state);
+        continue;
+      }
+
       summaryTrades.push({
         ok: true,
         ...result
@@ -1368,18 +1659,42 @@ async function runDailyCycleForIdentity(input: {
       saveActivityState(statePath, state);
     } catch (error) {
       const message = formatError(error);
+      if (isRiskLimitError(error)) {
+        summaryTrades.push({
+          ok: true,
+          skipped: true,
+          skipReason: "risk_limit",
+          index: trade.index,
+          symbol: trade.symbol,
+          side: trade.side,
+          sizeOrPercent: trade.sizeOrPercent,
+          leverage: trade.leverage,
+          orderType: trade.orderType,
+          error: message
+        });
+        console.log(`[${input.logPrefix} warn] trade ${trade.index} skipped by risk limit: ${message}`);
+        saveActivityState(statePath, state);
+        continue;
+      }
+
       summaryTrades.push({
         ok: false,
         index: trade.index,
         symbol: trade.symbol,
         side: trade.side,
         sizeOrPercent: trade.sizeOrPercent,
+        leverage: trade.leverage,
         orderType: trade.orderType,
         error: message
       });
       runRecord.tradesFailed += 1;
       console.log(`[${input.logPrefix} error] trade ${trade.index}: ${message}`);
       saveActivityState(statePath, state);
+
+      if (isFatalDailyCycleError(error)) {
+        console.log(`[${input.logPrefix} error] stopping wallet after fatal error: ${message}`);
+        break;
+      }
     }
   }
 
@@ -1409,17 +1724,17 @@ function resolveDailyCycleSettings(
   exchangeInfo: ExchangeSymbolInfo[]
 ): DailyCycleSettings {
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
-  const symbols = parseDailySymbols(options.symbols ?? "BTC,ETH,SOL", exchangeInfo);
+  const symbols = parseDailySymbols(options.symbols ?? "BTC,ETH", exchangeInfo);
   const minTrades = parsePositiveIntegerOption(options.minTrades ?? "3", "min-trades");
   const maxTrades = parsePositiveIntegerOption(options.maxTrades ?? "8", "max-trades");
   const minHoldMinutes = parsePositiveIntegerOption(options.minHoldMinutes ?? "5", "min-hold-minutes");
   const maxHoldMinutes = parsePositiveIntegerOption(options.maxHoldMinutes ?? "30", "max-hold-minutes");
   const minWaitMinutes = parsePositiveIntegerOption(options.minWaitMinutes ?? "15", "min-wait-minutes");
   const maxWaitMinutes = parsePositiveIntegerOption(options.maxWaitMinutes ?? "90", "max-wait-minutes");
-  const leverage = options.leverage?.trim() || "2";
-  const limitProbability = parsePercentageOption(options.limitProbability ?? "40", "limit-probability");
+  const leverageRange = normalizeLeverageInput(options.leverage ?? "5-10");
+  const limitProbability = parsePercentageOption(options.limitProbability ?? "0", "limit-probability");
   const limitOffsetBps = parsePositiveIntegerOption(options.limitOffsetBps ?? "8", "limit-offset-bps");
-  const sizeRange = normalizePercentSizingInput(options.sizeRange ?? "12-28%");
+  const sizeRange = normalizePercentSizingInput(options.sizeRange ?? "20-40%");
 
   if (minTrades > maxTrades) {
     fail("min-trades must be less than or equal to max-trades.");
@@ -1439,7 +1754,7 @@ function resolveDailyCycleSettings(
     minTrades,
     maxTrades,
     sizeRange,
-    leverage,
+    leverageRange,
     minHoldMinutes,
     maxHoldMinutes,
     minWaitMinutes,
@@ -1461,6 +1776,7 @@ function buildDailyTradePlan(settings: DailyCycleSettings): PlannedDailyTrade[] 
     side: sides[index],
     symbol: symbols[index],
     sizeOrPercent: drawPercentSizingInput(settings.sizeRange),
+    leverage: drawLeverageInput(settings.leverageRange),
     orderType: orderTypes[index],
     holdMs: randomInt(settings.minHoldMinutes, settings.maxHoldMinutes) * 60_000,
     waitBeforeMs: index === 0 ? 0 : randomInt(settings.minWaitMinutes, settings.maxWaitMinutes) * 60_000,
@@ -1483,17 +1799,14 @@ function buildDailySides(tradeCount: number): Array<"buy" | "sell"> {
 }
 
 function buildDailyOrderTypes(tradeCount: number, limitProbability: number): Array<"market" | "limit"> {
-  if (tradeCount === 1) {
-    return [Math.random() * 100 < limitProbability ? "limit" : "market"];
+  if (limitProbability <= 0) {
+    return new Array<"market" | "limit">(tradeCount).fill("market");
   }
 
-  const orderTypes: Array<"market" | "limit"> = ["market", "limit"];
-
-  while (orderTypes.length < tradeCount) {
-    orderTypes.push(Math.random() * 100 < limitProbability ? "limit" : "market");
-  }
-
-  return shuffleArray(orderTypes);
+  return Array.from(
+    { length: tradeCount },
+    () => (Math.random() * 100 < limitProbability ? "limit" : "market")
+  );
 }
 
 function buildDailySymbols(tradeCount: number, symbols: string[]): string[] {
@@ -1519,11 +1832,10 @@ async function executeDailyTrade(
   config: EnvConfig,
   identity: TradingIdentity,
   exchangeInfo: ExchangeSymbolInfo[],
-  trade: PlannedDailyTrade,
-  leverage: string
+  trade: PlannedDailyTrade
 ): Promise<Record<string, unknown>> {
   await cleanupSymbolState(api, identity, trade.symbol);
-  await ensureLeverage(api, config, identity, trade.symbol, exchangeInfo, leverage);
+  await ensureLeverage(api, config, identity, trade.symbol, exchangeInfo, trade.leverage);
 
   const account = await api.getFullAccount(identity.accountAddress);
   const size = await resolveOrderSize({
@@ -1532,7 +1844,7 @@ async function executeDailyTrade(
     sizeOrPercent: trade.sizeOrPercent,
     exchangeInfo,
     account,
-    leverageOverride: leverage
+    leverageOverride: trade.leverage
   });
 
   let actualOrderType: "market" | "limit" | "limit_fallback_market" = trade.orderType;
@@ -1548,11 +1860,11 @@ async function executeDailyTrade(
 
     const referencePrice = size.referencePrice ?? await api.getReferencePrice(trade.symbol);
     limitPrice = computeAggressiveLimitPrice(referencePrice, trade.side, trade.limitOffsetBps ?? 0, symbolInfo.tickSize);
-    const limitResponse = await api.submit(signOrderActions({
-      account: identity.accountAddress,
-      signerKeypair: identity.keypair,
-      nonce: nextNonce(),
-      actions: [
+    const limitResponse = submitSdkActions(
+      api,
+      identity.keypair,
+      identity.accountAddress,
+      [
         {
           l: {
             c: trade.symbol,
@@ -1563,19 +1875,20 @@ async function executeDailyTrade(
             r: false
           }
         }
-      ]
-    }));
+      ],
+      nextNonce()
+    );
     openStatuses = ensureAcceptedStatuses(limitResponse, `${trade.side} ${trade.symbol} limit`);
 
-    const filledPosition = await waitForPosition(api, identity.accountAddress, trade.symbol, 20_000);
+    const filledPosition = await waitForPosition(api, identity.accountAddress, trade.symbol, POSITION_OBSERVE_TIMEOUT_MS);
 
     if (!filledPosition || Math.abs(filledPosition.size) <= 0) {
       await cancelAllOrdersForSymbols(api, identity, [trade.symbol]);
-      const fallbackResponse = await api.submit(signOrderActions({
-        account: identity.accountAddress,
-        signerKeypair: identity.keypair,
-        nonce: nextNonce(),
-        actions: [
+      const fallbackResponse = submitSdkActions(
+        api,
+        identity.keypair,
+        identity.accountAddress,
+        [
           {
             m: {
               c: trade.symbol,
@@ -1584,17 +1897,18 @@ async function executeDailyTrade(
               r: false
             }
           }
-        ]
-      }));
+        ],
+        nextNonce()
+      );
       openStatuses = [...openStatuses, ...ensureAcceptedStatuses(fallbackResponse, `${trade.side} ${trade.symbol} market fallback`)];
       actualOrderType = "limit_fallback_market";
     }
   } else {
-    const response = await api.submit(signOrderActions({
-      account: identity.accountAddress,
-      signerKeypair: identity.keypair,
-      nonce: nextNonce(),
-      actions: [
+    const response = submitSdkActions(
+      api,
+      identity.keypair,
+      identity.accountAddress,
+      [
         {
           m: {
             c: trade.symbol,
@@ -1603,15 +1917,35 @@ async function executeDailyTrade(
             r: false
           }
         }
-      ]
-    }));
+      ],
+      nextNonce()
+    );
     openStatuses = ensureAcceptedStatuses(response, `${trade.side} ${trade.symbol} market`);
   }
 
-  const openedPosition = await waitForPosition(api, identity.accountAddress, trade.symbol, 20_000);
+  const openedPosition = await waitForPosition(api, identity.accountAddress, trade.symbol, POSITION_OBSERVE_TIMEOUT_MS);
 
   if (!openedPosition || Math.abs(openedPosition.size) <= 0) {
-    throw new Error(`Failed to observe an open position for ${trade.symbol}.`);
+    const cancelStatuses = await cancelAllOrdersForSymbols(api, identity, [trade.symbol]);
+    return {
+      index: trade.index,
+      symbol: trade.symbol,
+      side: trade.side,
+      requested: trade.sizeOrPercent,
+      requestedSize: size.size,
+      opened: false,
+      skippedReason: `No open position observed for ${trade.symbol} after ${POSITION_OBSERVE_TIMEOUT_MS}ms`,
+      leverage: size.leverage,
+      estimatedNotional: size.estimatedNotional,
+      estimatedMarginUsed: size.estimatedMarginUsed,
+      orderTypeRequested: trade.orderType,
+      orderTypeExecuted: actualOrderType,
+      limitPrice,
+      holdMinutes: 0,
+      openStatuses,
+      closeStatuses: cancelStatuses,
+      closed: true
+    };
   }
 
   console.log(`[daily-cycle] holding ${trade.symbol} for ${trade.holdMs}ms`);
@@ -1619,7 +1953,7 @@ async function executeDailyTrade(
 
   const closeResult = await closeSymbolForIdentity(api, identity, trade.symbol);
   await cancelAllOrdersForSymbols(api, identity, [trade.symbol]);
-  const closed = await waitForClosedPosition(api, identity.accountAddress, trade.symbol, 20_000);
+  const closed = await waitForClosedPosition(api, identity.accountAddress, trade.symbol, POSITION_CLOSE_TIMEOUT_MS);
 
   return {
     index: trade.index,
@@ -1657,7 +1991,7 @@ async function cleanupSymbolState(
 
   if (position && Math.abs(position.size) > 0) {
     await closeSymbolForIdentity(api, identity, symbol);
-    await waitForClosedPosition(api, identity.accountAddress, symbol, 20_000);
+    await waitForClosedPosition(api, identity.accountAddress, symbol, POSITION_CLOSE_TIMEOUT_MS);
   }
 }
 
@@ -1676,11 +2010,11 @@ async function closeSymbolForIdentity(
     };
   }
 
-  const response = await api.submit(signOrderActions({
-    account: identity.accountAddress,
-    signerKeypair: identity.keypair,
-    nonce: nextNonce(),
-    actions: [
+  const response = submitSdkActions(
+    api,
+    identity.keypair,
+    identity.accountAddress,
+    [
       {
         m: {
           c: symbol,
@@ -1689,8 +2023,9 @@ async function closeSymbolForIdentity(
           r: true
         }
       }
-    ]
-  }));
+    ],
+    nextNonce()
+  );
 
   return {
     statuses: ensureAcceptedStatuses(response, `close ${symbol}`),
@@ -1709,18 +2044,25 @@ async function cancelAllOrdersForSymbols(
     return [];
   }
 
-  const response = await api.submit(signOrderActions({
-    account: identity.accountAddress,
-    signerKeypair: identity.keypair,
-    nonce: nextNonce(),
-    actions: [
+  const response = submitSdkActions(
+    api,
+    identity.keypair,
+    identity.accountAddress,
+    [
       {
         cxa: {
           c: uniqueSymbols
         }
       }
-    ]
-  }));
+    ],
+    nextNonce()
+  );
+
+  const statuses = extractStatuses(response);
+
+  if (isNoOrdersFoundCancelAllResponse(statuses)) {
+    return statuses;
+  }
 
   return ensureAcceptedStatuses(response, `cancel all ${uniqueSymbols.join(",")}`);
 }
@@ -1872,6 +2214,10 @@ function parsePercentageOption(raw: string, label: string): number {
   return value;
 }
 
+function stripTrailingZeroes(value: string): string {
+  return value.replace(/\.0+$/, "").replace(/(\.\d*?)0+$/, "$1");
+}
+
 function normalizePercentSizingInput(raw: string): string {
   const trimmed = raw.trim();
 
@@ -1882,12 +2228,45 @@ function normalizePercentSizingInput(raw: string): string {
   const percent = resolvePercentInput(trimmed);
 
   if (percent === null) {
-    fail("size-range must be a percent like 20% or a range like 12-28%.");
+    fail("size-range must be a percent like 20% or a range like 20-40%.");
   }
 
   return trimmed.includes("-")
     ? trimmed.replace(/\s+/g, "")
     : `${percent}%`;
+}
+
+function normalizeLeverageInput(raw: string): string {
+  const trimmed = raw.trim();
+
+  if (!trimmed) {
+    fail("leverage cannot be empty.");
+  }
+
+  if (!trimmed.includes("-")) {
+    const value = Number(trimmed);
+
+    if (!Number.isFinite(value) || value <= 0) {
+      fail("leverage must be a positive number like 5 or a range like 5-10.");
+    }
+
+    return stripTrailingZeroes(value.toFixed(2));
+  }
+
+  const match = trimmed.match(/^(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)$/);
+
+  if (!match) {
+    fail("leverage must be a positive number like 5 or a range like 5-10.");
+  }
+
+  const min = Number(match[1]);
+  const max = Number(match[2]);
+
+  if (!Number.isFinite(min) || !Number.isFinite(max) || min <= 0 || max <= 0 || min > max) {
+    fail("leverage range must be positive and min must be less than or equal to max.");
+  }
+
+  return `${stripTrailingZeroes(min.toFixed(2))}-${stripTrailingZeroes(max.toFixed(2))}`;
 }
 
 function drawPercentSizingInput(raw: string): string {
@@ -1902,6 +2281,23 @@ function drawPercentSizingInput(raw: string): string {
   }
 
   return `${randomPercentInRange(Number(match[1]), Number(match[2]))}%`;
+}
+
+function drawLeverageInput(raw: string): string {
+  if (!raw.includes("-")) {
+    return raw;
+  }
+
+  const match = raw.match(/^(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)$/);
+
+  if (!match) {
+    return raw;
+  }
+
+  const min = Number(match[1]);
+  const max = Number(match[2]);
+  const rounded = Math.round((min + Math.random() * (max - min)) * 100) / 100;
+  return stripTrailingZeroes(rounded.toFixed(2));
 }
 
 function shuffleArray<T>(items: T[]): T[] {
@@ -1982,13 +2378,18 @@ async function connectWalletProfile(
       ? existingAgentKeypair
       : createKeypair();
 
-  const authResponse = await api.submit(signAgentWalletAction({
-    account: ownerKeypair.pubkey,
-    signerKeypair: ownerKeypair,
-    nonce: nextNonce(),
-    agentPubkey: agentKeypair.pubkey,
-    deleteFlag: false
-  }));
+  const authResponse = submitSdkActions(
+    api,
+    ownerKeypair,
+    ownerKeypair.pubkey,
+    [{
+      agentWalletCreation: {
+        a: agentKeypair.pubkey,
+        d: false
+      }
+    }],
+    nextNonce()
+  );
 
   try {
     ensureAcceptedStatuses(authResponse, "agent wallet registration");
@@ -2001,12 +2402,17 @@ async function connectWalletProfile(
 
   if (!options.skipMaxLeverage) {
     const exchangeInfo = await api.getExchangeInfo();
-    const settingsResponse = await api.submit(signUserSettingsAction({
-      account: ownerKeypair.pubkey,
-      signerKeypair: ownerKeypair,
-      nonce: nextNonce(),
-      leverageMap: Object.fromEntries(exchangeInfo.map((item) => [item.symbol, item.maxLeverage]))
-    }));
+    const settingsResponse = submitSdkActions(
+      api,
+      ownerKeypair,
+      ownerKeypair.pubkey,
+      [{
+        updateUserSettings: {
+          m: Object.fromEntries(exchangeInfo.map((item) => [item.symbol, item.maxLeverage]))
+        }
+      }],
+      nextNonce()
+    );
     ensureAcceptedStatuses(settingsResponse, "max leverage setup");
   }
 
@@ -2033,13 +2439,11 @@ async function submitOrderForProfile(
     options: { price?: string; tif?: OrderTimeInForce; leverage?: string };
   }
 ): Promise<Record<string, unknown>> {
-  if (!profile.accountAddress || !profile.agentSecretKey) {
-    throw new Error(`Wallet "${profile.name}" is not connected. Run batch-connect first.`);
-  }
-
+  const ownerKeypair = loadKeypair(profile.ownerSecretKey);
   const identity: TradingIdentity = {
-    accountAddress: profile.accountAddress,
-    keypair: loadKeypair(profile.agentSecretKey)
+    accountAddress: profile.accountAddress ?? ownerKeypair.pubkey,
+    keypair: ownerKeypair,
+    ownerKeypair
   };
 
   const symbol = normalizeSymbol(input.symbol);
@@ -2048,8 +2452,8 @@ async function submitOrderForProfile(
     api,
     {
       apiBaseUrl: "",
-      accountAddress: profile.accountAddress,
-      ownerSecretKey: undefined,
+      accountAddress: identity.accountAddress,
+      ownerSecretKey: profile.ownerSecretKey,
       agentSecretKey: profile.agentSecretKey,
       agentPublicKey: profile.agentPublicKey,
       defaultLeverage: undefined,
@@ -2079,11 +2483,11 @@ async function submitOrderForProfile(
     throw new Error("Limit order requires a positive --price.");
   }
 
-  const response = await api.submit(signOrderActions({
-    account: identity.accountAddress,
-    signerKeypair: identity.keypair,
-    nonce: nextNonce(),
-    actions: [
+  const response = submitSdkActions(
+    api,
+    identity.keypair,
+    identity.accountAddress,
+    [
       isLimit
         ? {
             l: {
@@ -2103,8 +2507,9 @@ async function submitOrderForProfile(
               r: false
             }
           }
-    ]
-  }));
+    ],
+    nextNonce()
+  );
 
   return {
     symbol,
@@ -2128,13 +2533,11 @@ async function closeWalletSymbol(
   profile: WalletProfile,
   symbol: string
 ): Promise<Record<string, unknown>> {
-  if (!profile.accountAddress || !profile.agentSecretKey) {
-    throw new Error(`Wallet "${profile.name}" is not connected. Run batch-connect first.`);
-  }
-
+  const ownerKeypair = loadKeypair(profile.ownerSecretKey);
   const identity: TradingIdentity = {
-    accountAddress: profile.accountAddress,
-    keypair: loadKeypair(profile.agentSecretKey)
+    accountAddress: profile.accountAddress ?? ownerKeypair.pubkey,
+    keypair: ownerKeypair,
+    ownerKeypair
   };
 
   const account = await api.getFullAccount(identity.accountAddress);
@@ -2147,11 +2550,11 @@ async function closeWalletSymbol(
     };
   }
 
-  const response = await api.submit(signOrderActions({
-    account: identity.accountAddress,
-    signerKeypair: identity.keypair,
-    nonce: nextNonce(),
-    actions: [
+  const response = submitSdkActions(
+    api,
+    identity.keypair,
+    identity.accountAddress,
+    [
       {
         m: {
           c: symbol,
@@ -2160,8 +2563,9 @@ async function closeWalletSymbol(
           r: true
         }
       }
-    ]
-  }));
+    ],
+    nextNonce()
+  );
 
   return {
     symbol,
@@ -2200,13 +2604,74 @@ function sleep(ms: number): Promise<void> {
 
 function formatError(error: unknown): string {
   if (error instanceof Error) {
-    return error.message;
+    return sanitizeLogMessage(error.message);
   }
 
-  return String(error);
+  return sanitizeLogMessage(String(error));
 }
 
-async function retryBatchConnect<T>(walletName: string, action: (attempt: number) => Promise<T>): Promise<T> {
+function sanitizeLogMessage(message: string): string {
+  const normalized = message.replace(/\s+/g, " ").trim();
+
+  if (!normalized.includes("<html") && normalized.length <= 700) {
+    return normalized;
+  }
+
+  const title = normalized.match(/<title>(.*?)<\/title>/i)?.[1]?.trim();
+  const rayId = normalized.match(/Cloudflare Ray ID:\s*<strong[^>]*>(.*?)<\/strong>/i)?.[1]?.trim();
+  const host = normalized.match(/cf-host-status.*?<span class="md:block w-full truncate">(.*?)<\/span>/i)?.[1]?.trim();
+
+  if (title || normalized.includes("cf-error-details")) {
+    const parts = [
+      title,
+      host ? `host=${host}` : undefined,
+      rayId ? `ray=${rayId}` : undefined
+    ].filter(Boolean);
+
+    return parts.join("; ") || "Cloudflare error page";
+  }
+
+  return normalized.length > 700 ? `${normalized.slice(0, 700)}...` : normalized;
+}
+
+function isFatalDailyCycleError(error: unknown): boolean {
+  return formatError(error).toLowerCase().includes("unauthorized signer");
+}
+
+function isRiskLimitError(error: unknown): boolean {
+  const message = formatError(error).toLowerCase();
+  return message.includes("rejectedrisklimit") || message.includes("risk limit");
+}
+
+function isBadSignatureError(error: unknown): boolean {
+  return formatError(error).toLowerCase().includes("bad signature");
+}
+
+function isFaucetAuthError(error: unknown): boolean {
+  const message = formatError(error).toLowerCase();
+  return message.includes("faucet failed") && (
+    message.includes("unauthorized signer") ||
+    message.includes("bad signature")
+  );
+}
+
+function isNoOrdersFoundCancelAllResponse(statuses: Array<Record<string, unknown>>): boolean {
+  return statuses.length > 0 && statuses.every((status) => {
+    const rejected = status.cancelAllRejected;
+
+    if (!rejected || typeof rejected !== "object" || !("reason" in rejected)) {
+      return false;
+    }
+
+    return String((rejected as { reason?: unknown }).reason).toLowerCase().includes("no orders found");
+  });
+}
+
+async function retryBatchConnect<T>(
+  walletName: string,
+  action: (attempt: number) => Promise<T>,
+  actionName = "connect"
+): Promise<T> {
   let lastError: unknown;
 
   for (let attempt = 1; attempt <= BATCH_CONNECT_RETRY_ATTEMPTS; attempt += 1) {
@@ -2220,7 +2685,7 @@ async function retryBatchConnect<T>(walletName: string, action: (attempt: number
       }
 
       const delayMs = randomInt(BATCH_CONNECT_RETRY_DELAY_MIN_MS, BATCH_CONNECT_RETRY_DELAY_MAX_MS);
-      console.log(`[connect retry wait] ${walletName} ${delayMs}ms: ${formatError(error)}`);
+      console.log(`[${actionName} retry wait] ${walletName} ${delayMs}ms: ${formatError(error)}`);
       await sleep(delayMs);
     }
   }

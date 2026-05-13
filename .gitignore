@@ -3,6 +3,8 @@ dist/
 .env
 .secrets.env
 .wallets.json
-.seeds.txt
 .proxies.txt
+.seeds.txt
+.activity-state.json
+.wallets.failed.json
 *.log

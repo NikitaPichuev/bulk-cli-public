@@ -3,7 +3,7 @@ import { Agent, ProxyAgent, type Dispatcher } from "undici";
 import { normalizeProxyUrlInput } from "./network";
 import type { ActionEnvelope, ExchangeSymbolInfo, FullAccountState } from "./types";
 
-interface ApiResponse {
+export interface ApiResponse {
   status: string;
   response?: {
     type: string;
@@ -15,15 +15,25 @@ interface ApiResponse {
 
 export class BulkApiClient {
   private readonly dispatcher: Dispatcher;
+  private readonly normalizedProxyUrl?: string;
 
   constructor(
     private readonly baseUrl: string,
     proxyUrl?: string | null
   ) {
     const normalizedProxyUrl = normalizeProxyUrlInput(proxyUrl);
+    this.normalizedProxyUrl = normalizedProxyUrl ?? undefined;
     this.dispatcher = normalizedProxyUrl
       ? new ProxyAgent(normalizedProxyUrl)
       : new Agent();
+  }
+
+  getBaseUrl(): string {
+    return this.baseUrl;
+  }
+
+  getProxyUrl(): string | undefined {
+    return this.normalizedProxyUrl;
   }
 
   async getExchangeInfo(): Promise<ExchangeSymbolInfo[]> {
@@ -65,11 +75,30 @@ export class BulkApiClient {
   }
 
   async getReferencePrice(symbol: string): Promise<number> {
+    try {
+      const tickerResponse = await this.request(`${this.baseUrl}/ticker/${encodeURIComponent(symbol)}`, undefined, `ticker ${symbol}`);
+      const ticker = (await this.parseJson(tickerResponse)) as {
+        oraclePrice?: number;
+        markPrice?: number;
+        lastPrice?: number;
+      };
+
+      const price = ticker.oraclePrice ?? ticker.markPrice ?? ticker.lastPrice;
+
+      if (price && Number.isFinite(price)) {
+        return price;
+      }
+    } catch {
+      // Fall through to legacy reference source below.
+    }
+
     const pythSymbol = toPythSymbol(symbol);
     const now = Math.floor(Date.now() / 1000);
     const response = await this.request(
-      `https://history.pyth-lazer.dourolabs.app/v1/real_time/history?symbol=${encodeURIComponent(pythSymbol)}&resolution=1&from=${now - 60}&to=${now}`
-      , undefined, `reference price ${symbol}`);
+      `https://history.pyth-lazer.dourolabs.app/v1/real_time/history?symbol=${encodeURIComponent(pythSymbol)}&resolution=1&from=${now - 60}&to=${now}`,
+      undefined,
+      `reference price ${symbol}`
+    );
 
     const payload = (await this.parseJson(response)) as {
       c?: number[];
@@ -117,13 +146,13 @@ export class BulkApiClient {
     const text = await response.text();
 
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${text}`);
+      throw new Error(`HTTP ${response.status}: ${formatHttpErrorBody(text)}`);
     }
 
     try {
       return JSON.parse(text) as unknown;
     } catch (error) {
-      throw new Error(`Failed to parse JSON response: ${text}`);
+      throw new Error(`Failed to parse JSON response: ${formatHttpErrorBody(text)}`);
     }
   }
 }
@@ -143,6 +172,30 @@ function formatFetchError(error: unknown): string {
   }
 
   return String(error);
+}
+
+function formatHttpErrorBody(text: string): string {
+  const normalized = text.replace(/\s+/g, " ").trim();
+
+  if (!normalized) {
+    return "";
+  }
+
+  const title = normalized.match(/<title>(.*?)<\/title>/i)?.[1]?.trim();
+  const rayId = normalized.match(/Cloudflare Ray ID:\s*<strong[^>]*>(.*?)<\/strong>/i)?.[1]?.trim();
+  const host = normalized.match(/cf-host-status.*?<span class="md:block w-full truncate">(.*?)<\/span>/i)?.[1]?.trim();
+
+  if (title || normalized.includes("cf-error-details")) {
+    const parts = [
+      title,
+      host ? `host=${host}` : undefined,
+      rayId ? `ray=${rayId}` : undefined
+    ].filter(Boolean);
+
+    return parts.join("; ") || "Cloudflare error page";
+  }
+
+  return normalized.length > 500 ? `${normalized.slice(0, 500)}...` : normalized;
 }
 
 async function sleep(ms: number): Promise<void> {
