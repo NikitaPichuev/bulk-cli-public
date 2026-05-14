@@ -14,7 +14,7 @@ try {
     --file .wallets.json `
     --proxies-file .proxies.txt `
     --concurrency 3 `
-    --symbols "BTC" `
+    --symbols "BTC,ETH" `
     --min-trades 4 `
     --max-trades 8 `
     --size-range 20-42% `
