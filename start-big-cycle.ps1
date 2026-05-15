@@ -14,15 +14,16 @@ try {
     --file .wallets.json `
     --proxies-file .proxies.txt `
     --concurrency 3 `
-    --symbols "BTC,ETH" `
-    --min-trades 4 `
-    --max-trades 8 `
-    --size-range 20-42% `
-    --leverage 20-30 `
-    --min-hold-minutes 5 `
-    --max-hold-minutes 30 `
-    --min-wait-minutes 15 `
-    --max-wait-minutes 90 `
+    --symbols "BTC-USD,ETH-USD,ZEC-USD,SOL-USD,SUI-USD,BNB-USD,XRP-USD,FART-USD,DOGE-USD" `
+    --min-trades 9 `
+    --max-trades 9 `
+    --size-range 95-99% `
+    --leverage 50 `
+    --open-only `
+    --min-hold-minutes 1000 `
+    --max-hold-minutes 10000 `
+    --min-wait-minutes 1 `
+    --max-wait-minutes 1 `
     --limit-probability 0
 
   if ($LASTEXITCODE -ne 0) {

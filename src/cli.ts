@@ -51,6 +51,7 @@ interface DailyCycleCommandOptions {
   maxWaitMinutes?: string;
   limitProbability?: string;
   limitOffsetBps?: string;
+  openOnly?: boolean;
   dryRun?: boolean;
 }
 
@@ -78,6 +79,7 @@ interface DailyCycleSettings {
   maxWaitMinutes: number;
   limitProbability: number;
   limitOffsetBps: number;
+  openOnly: boolean;
   timezone: string;
 }
 
@@ -176,9 +178,44 @@ const SYMBOL_ALIASES: Record<string, string> = {
   BTC: "BTC-USD",
   ETH: "ETH-USD",
   SOL: "SOL-USD",
+  ZEC: "ZEC-USD",
+  SUI: "SUI-USD",
+  BNB: "BNB-USD",
+  FART: "FART-USD",
+  DOGE: "DOGE-USD",
   XRP: "XRP-USD",
   GOLD: "GOLD-USD"
 };
+
+const FALLBACK_EXCHANGE_INFO: Record<string, ExchangeSymbolInfo> = Object.fromEntries(
+  ([
+    ["BTC-USD", "BTC", 0.1, 0.000001],
+    ["ETH-USD", "ETH", 0.01, 0.0001],
+    ["ZEC-USD", "ZEC", 0.01, 0.0001],
+    ["SOL-USD", "SOL", 0.001, 0.0001],
+    ["SUI-USD", "SUI", 0.0001, 0.01],
+    ["BNB-USD", "BNB", 0.01, 0.001],
+    ["XRP-USD", "XRP", 0.0001, 0.01],
+    ["FART-USD", "FART", 0.0001, 0.01],
+    ["DOGE-USD", "DOGE", 0.00001, 1]
+  ] as Array<[string, string, number, number]>).map(([symbol, baseAsset, tickSize, lotSize]) => [
+    symbol,
+    {
+      symbol,
+      baseAsset,
+      quoteAsset: "USD",
+      status: "TRADING",
+      pricePrecision: 8,
+      sizePrecision: 8,
+      tickSize,
+      lotSize,
+      minNotional: 50,
+      maxLeverage: 50,
+      orderTypes: ["market", "limit"],
+      timeInForces: ["GTC", "IOC", "ALO"]
+    } satisfies ExchangeSymbolInfo
+  ])
+);
 
 const MARKET_ORDER_SAFETY_FACTOR = 0.985;
 const BATCH_CONNECT_RETRY_ATTEMPTS = 3;
@@ -191,7 +228,7 @@ const POSITION_OBSERVE_TIMEOUT_MS = 60_000;
 const POSITION_CLOSE_TIMEOUT_MS = 60_000;
 const ORDER_NOTIONAL_BUFFER = 1.01;
 const ORDER_MIN_TARGET_NOTIONAL = 5000;
-const ORDER_RISK_TARGET_NOTIONAL = 10000;
+const ORDER_RISK_TARGET_NOTIONAL = Number.POSITIVE_INFINITY;
 
 interface TestFundsResult {
   faucetRequested: boolean;
@@ -457,6 +494,7 @@ program
   .option("--max-wait-minutes <minutes>", "Maximum wait between trades", "90")
   .option("--limit-probability <percent>", "How often to use limit orders instead of market orders", "0")
   .option("--limit-offset-bps <bps>", "Aggressive limit offset in basis points", "8")
+  .option("--open-only", "Open positions and do not close them", false)
   .option("--dry-run", "Print the planned routine without sending orders", false)
   .action(async (options: DailyCycleCommandOptions) => {
     await runDailyCycle(options);
@@ -485,6 +523,7 @@ program
   .option("--max-wait-minutes <minutes>", "Maximum wait between trades", "90")
   .option("--limit-probability <percent>", "How often to use limit orders instead of market orders", "0")
   .option("--limit-offset-bps <bps>", "Aggressive limit offset in basis points", "8")
+  .option("--open-only", "Open positions and do not close them", false)
   .option("--dry-run", "Print the planned routines without sending orders", false)
   .action(async (options: BatchDailyCycleCommandOptions) => {
     await runBatchDailyCycle(options);
@@ -1009,9 +1048,11 @@ async function resolveOrderSize(input: {
   exchangeInfo: ExchangeSymbolInfo[];
   account: FullAccountState;
   leverageOverride?: string;
+  availableBalanceOverride?: number;
+  balanceShareDivisor?: number;
 }): Promise<ResolvedOrderSize> {
   const raw = input.sizeOrPercent.trim();
-  const symbolInfo = input.exchangeInfo.find((item) => item.symbol === input.symbol);
+  const symbolInfo = getExchangeSymbolInfo(input.exchangeInfo, input.symbol);
 
   if (!symbolInfo) {
     fail(`Unknown symbol: ${input.symbol}`);
@@ -1041,11 +1082,7 @@ async function resolveOrderSize(input: {
     fail("Percent sizing supports values from 0 to 99.");
   }
 
-  if (!["BTC-USD", "ETH-USD", "SOL-USD"].includes(input.symbol)) {
-    fail("Percent sizing is enabled for BTC, ETH and SOL only.");
-  }
-
-  const availableBalance = input.account.margin?.availableBalance ?? 0;
+  const availableBalance = input.availableBalanceOverride ?? input.account.margin?.availableBalance ?? 0;
 
   if (!Number.isFinite(availableBalance) || availableBalance <= 0) {
     fail("Available balance is zero.");
@@ -1064,7 +1101,8 @@ async function resolveOrderSize(input: {
   }
 
   const referencePrice = await input.api.getReferencePrice(input.symbol);
-  const requestedMarginBudget = availableBalance * (percent / 100);
+  const shareDivisor = Math.max(1, input.balanceShareDivisor ?? 1);
+  const requestedMarginBudget = (availableBalance * (percent / 100)) / shareDivisor;
   const requestedNotional = requestedMarginBudget * leverage * MARKET_ORDER_SAFETY_FACTOR;
   const minimumTradableNotional = Math.max(symbolInfo.minNotional * ORDER_NOTIONAL_BUFFER, ORDER_MIN_TARGET_NOTIONAL);
   if (minimumTradableNotional > ORDER_RISK_TARGET_NOTIONAL) {
@@ -1109,7 +1147,7 @@ function resolveLeverage(
     return existing;
   }
 
-  const symbolInfo = exchangeInfo.find((item) => item.symbol === symbol);
+  const symbolInfo = getExchangeSymbolInfo(exchangeInfo, symbol);
   if (!symbolInfo) {
     fail(`Unknown symbol: ${symbol}`);
   }
@@ -1119,6 +1157,10 @@ function resolveLeverage(
   }
 
   return symbolInfo.maxLeverage;
+}
+
+function getExchangeSymbolInfo(exchangeInfo: ExchangeSymbolInfo[], symbol: string): ExchangeSymbolInfo | undefined {
+  return exchangeInfo.find((item) => item.symbol === symbol) ?? FALLBACK_EXCHANGE_INFO[symbol];
 }
 
 function normalizeSymbol(value: string): string {
@@ -1566,7 +1608,8 @@ async function runDailyCycleForIdentity(input: {
   activityState?: ActivityStateFile;
 }): Promise<DailyCycleRunResult | DailyCycleDryRunResult> {
   const localDate = getLocalDateString(new Date(), input.settings.timezone);
-  const plan = buildDailyTradePlan(input.settings);
+  const walletNumber = parseWalletNumberFromLogPrefix(input.logPrefix);
+  const plan = buildDailyTradePlan(input.settings, walletNumber);
   const statePath = resolveActivityStateFile(input.settings.stateFile);
   const summaryTrades: Array<Record<string, unknown>> = [];
 
@@ -1628,6 +1671,12 @@ async function runDailyCycleForIdentity(input: {
     console.log(`[${input.logPrefix}] faucet already attempted today, skipping`);
   }
 
+  const initialAccount = input.settings.openOnly
+    ? await input.api.getFullAccount(input.identity.accountAddress)
+    : null;
+  const initialAvailableBalance = initialAccount?.margin?.availableBalance;
+  const balanceShareDivisor = input.settings.openOnly ? Math.max(1, plan.length) : 1;
+
   for (const trade of plan) {
     if (trade.waitBeforeMs > 0) {
       console.log(`[${input.logPrefix}] wait before trade ${trade.index}/${plan.length}: ${trade.waitBeforeMs}ms`);
@@ -1636,7 +1685,20 @@ async function runDailyCycleForIdentity(input: {
 
     try {
       console.log(`[${input.logPrefix}] trade ${trade.index}/${plan.length}: ${trade.side} ${trade.symbol} ${trade.sizeOrPercent} x${trade.leverage} (${trade.orderType})`);
-      const result = await executeDailyTrade(input.api, input.config, input.identity, input.exchangeInfo, trade);
+      const result = await executeDailyTrade(
+        input.api,
+        input.config,
+        input.identity,
+        input.exchangeInfo,
+        trade,
+        input.settings.openOnly
+          ? {
+              availableBalanceOverride: initialAvailableBalance,
+              balanceShareDivisor
+            }
+          : undefined,
+        input.settings.openOnly
+      );
       if (result.opened === false) {
         summaryTrades.push({
           ok: true,
@@ -1761,15 +1823,20 @@ function resolveDailyCycleSettings(
     maxWaitMinutes,
     limitProbability,
     limitOffsetBps,
+    openOnly: options.openOnly ?? false,
     timezone
   };
 }
 
-function buildDailyTradePlan(settings: DailyCycleSettings): PlannedDailyTrade[] {
+function buildDailyTradePlan(settings: DailyCycleSettings, walletNumber?: number): PlannedDailyTrade[] {
   const tradeCount = randomInt(settings.minTrades, settings.maxTrades);
-  const sides = buildDailySides(tradeCount);
   const orderTypes = buildDailyOrderTypes(tradeCount, settings.limitProbability);
-  const symbols = buildDailySymbols(tradeCount, settings.symbols);
+  const symbols = settings.openOnly
+    ? buildOpenOnlySymbols(tradeCount, settings.symbols)
+    : buildDailySymbols(tradeCount, settings.symbols);
+  const sides = settings.openOnly
+    ? buildMatrixSides(symbols, walletNumber)
+    : buildDailySides(tradeCount);
 
   return Array.from({ length: tradeCount }, (_, index) => ({
     index: index + 1,
@@ -1782,6 +1849,74 @@ function buildDailyTradePlan(settings: DailyCycleSettings): PlannedDailyTrade[] 
     waitBeforeMs: index === 0 ? 0 : randomInt(settings.minWaitMinutes, settings.maxWaitMinutes) * 60_000,
     limitOffsetBps: orderTypes[index] === "limit" ? settings.limitOffsetBps : null
   }));
+}
+
+function buildOpenOnlySymbols(tradeCount: number, symbols: string[]): string[] {
+  if (tradeCount <= symbols.length) {
+    return symbols.slice(0, tradeCount);
+  }
+
+  return Array.from({ length: tradeCount }, (_, index) => symbols[index % symbols.length]);
+}
+
+function parseWalletNumberFromLogPrefix(logPrefix: string): number | undefined {
+  const match = logPrefix.match(/wallet-(\d+)/i);
+  if (!match) {
+    return undefined;
+  }
+
+  const value = Number(match[1]);
+  return Number.isInteger(value) && value > 0 ? value : undefined;
+}
+
+function buildMatrixSides(symbols: string[], walletNumber?: number): Array<"buy" | "sell"> {
+  if (!walletNumber || symbols.length === 0) {
+    return buildDailySides(symbols.length);
+  }
+
+  if (walletNumber === 1) {
+    return symbols.map(() => "buy");
+  }
+
+  if (walletNumber === 2) {
+    return symbols.map(() => "sell");
+  }
+
+  if (walletNumber >= 3 && walletNumber < 3 + symbols.length) {
+    const longIndex = walletNumber - 3;
+    return symbols.map((_, index) => index === longIndex ? "buy" : "sell");
+  }
+
+  if (walletNumber >= 12 && walletNumber < 12 + symbols.length) {
+    const shortIndex = walletNumber - 12;
+    return symbols.map((_, index) => index === shortIndex ? "sell" : "buy");
+  }
+
+  const pairs = buildIndexPairs(symbols.length);
+
+  if (walletNumber >= 21 && walletNumber < 21 + pairs.length) {
+    const longPair = new Set(pairs[walletNumber - 21]);
+    return symbols.map((_, index) => longPair.has(index) ? "buy" : "sell");
+  }
+
+  if (walletNumber >= 57) {
+    const shortPair = new Set(pairs[(walletNumber - 57) % pairs.length]);
+    return symbols.map((_, index) => shortPair.has(index) ? "sell" : "buy");
+  }
+
+  return buildDailySides(symbols.length);
+}
+
+function buildIndexPairs(count: number): number[][] {
+  const pairs: number[][] = [];
+
+  for (let left = 0; left < count; left += 1) {
+    for (let right = left + 1; right < count; right += 1) {
+      pairs.push([left, right]);
+    }
+  }
+
+  return pairs;
 }
 
 function buildDailySides(tradeCount: number): Array<"buy" | "sell"> {
@@ -1832,7 +1967,12 @@ async function executeDailyTrade(
   config: EnvConfig,
   identity: TradingIdentity,
   exchangeInfo: ExchangeSymbolInfo[],
-  trade: PlannedDailyTrade
+  trade: PlannedDailyTrade,
+  sizing?: {
+    availableBalanceOverride?: number;
+    balanceShareDivisor?: number;
+  },
+  openOnly = false
 ): Promise<Record<string, unknown>> {
   await cleanupSymbolState(api, identity, trade.symbol);
   await ensureLeverage(api, config, identity, trade.symbol, exchangeInfo, trade.leverage);
@@ -1844,7 +1984,9 @@ async function executeDailyTrade(
     sizeOrPercent: trade.sizeOrPercent,
     exchangeInfo,
     account,
-    leverageOverride: trade.leverage
+    leverageOverride: trade.leverage,
+    availableBalanceOverride: sizing?.availableBalanceOverride,
+    balanceShareDivisor: sizing?.balanceShareDivisor
   });
 
   let actualOrderType: "market" | "limit" | "limit_fallback_market" = trade.orderType;
@@ -1852,7 +1994,7 @@ async function executeDailyTrade(
   let openStatuses: Array<Record<string, unknown>>;
 
   if (trade.orderType === "limit") {
-    const symbolInfo = exchangeInfo.find((item) => item.symbol === trade.symbol);
+    const symbolInfo = getExchangeSymbolInfo(exchangeInfo, trade.symbol);
 
     if (!symbolInfo) {
       throw new Error(`Unknown symbol in daily cycle: ${trade.symbol}`);
@@ -1945,6 +2087,28 @@ async function executeDailyTrade(
       openStatuses,
       closeStatuses: cancelStatuses,
       closed: true
+    };
+  }
+
+  if (openOnly) {
+    return {
+      index: trade.index,
+      symbol: trade.symbol,
+      side: trade.side,
+      requested: trade.sizeOrPercent,
+      openedSize: Math.abs(openedPosition.size),
+      requestedSize: size.size,
+      sizingMode: size.mode,
+      leverage: size.leverage,
+      estimatedNotional: size.estimatedNotional,
+      estimatedMarginUsed: size.estimatedMarginUsed,
+      orderTypeRequested: trade.orderType,
+      orderTypeExecuted: actualOrderType,
+      limitPrice,
+      holdMinutes: Math.round(trade.holdMs / 60_000),
+      openStatuses,
+      closeStatuses: [],
+      closed: false
     };
   }
 
@@ -2136,7 +2300,10 @@ function roundToNearestStep(value: number, step: number): number {
 }
 
 function parseDailySymbols(raw: string, exchangeInfo: ExchangeSymbolInfo[]): string[] {
-  const supported = new Set(exchangeInfo.map((item) => item.symbol));
+  const supported = new Set([
+    ...exchangeInfo.map((item) => item.symbol),
+    ...Object.keys(FALLBACK_EXCHANGE_INFO)
+  ]);
   const symbols = raw
     .split(",")
     .map((item) => normalizeSymbol(item))
