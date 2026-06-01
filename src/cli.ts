@@ -4,6 +4,8 @@ import { Command } from "commander";
 
 import { getOrCreateAccountActivity, loadActivityState, resolveActivityStateFile, saveActivityState, type ActivityRunRecord, type ActivityStateFile } from "./activityState";
 import { BulkApiClient, ensureAcceptedStatuses, extractStatuses } from "./bulkApi";
+import { checkPredepositAura } from "./auraApi";
+import { checkPredepositAuraWithChrome } from "./auraBrowser";
 import { loadConfig, upsertEnvFile } from "./config";
 import { createKeypair, createSigner, decodeEnvelope, decodeEnvelopeArray, loadKeypair, nextNonce, type NativeKeypair } from "./nativeBulk";
 import { configureNetworking, getVisibleIp, normalizeProxyUrlInput } from "./network";
@@ -64,6 +66,14 @@ interface BatchDailyCycleCommandOptions extends DailyCycleCommandOptions {
   wallets?: string;
   maxWallets?: string;
   shuffleWallets?: boolean;
+}
+
+interface BatchAuraCommandOptions extends BatchCommandOptions {
+  concurrency?: string;
+  wallets?: string;
+  maxWallets?: string;
+  output?: string;
+  browser?: boolean;
 }
 
 interface DailyCycleSettings {
@@ -607,6 +617,22 @@ program
       file: filePath,
       wallets: results
     }, null, 2));
+  });
+
+program
+  .command("batch-aura")
+  .description("Check AURA predeposit points for wallets from a JSON wallet file")
+  .option("--file <path>", "Wallets JSON file", ".wallets.json")
+  .option("--proxies-file <path>", "Optional proxies text file, one proxy per line", ".proxies.txt")
+  .option("--delay-ms <ms>", "Base delay between wallets in milliseconds", "1000")
+  .option("--jitter-ms <ms>", "Random extra delay between wallets in milliseconds", "2000")
+  .option("--concurrency <count>", "How many wallets to check in parallel", "3")
+  .option("--wallets <list>", "Comma-separated wallet names to include, for example wallet-1,wallet-7")
+  .option("--max-wallets <count>", "Maximum number of wallets to process in this run")
+  .option("--output <path>", "Write full JSON report to a file", ".aura-points.json")
+  .option("--browser", "Use local Chrome session for Vercel-protected AURA API", false)
+  .action(async (options: BatchAuraCommandOptions) => {
+    await runBatchAuraCheck(options);
   });
 
 program
@@ -1597,6 +1623,179 @@ async function runBatchDailyCycle(options: BatchDailyCycleCommandOptions): Promi
   }, null, 2));
 }
 
+async function runBatchAuraCheck(options: BatchAuraCommandOptions): Promise<void> {
+  const config = loadConfig();
+  configureNetworking(config);
+
+  const filePath = resolveWalletFile(options.file ?? ".wallets.json");
+  const allProfiles = loadWalletProfiles(filePath).filter((item) => item.enabled !== false);
+  const proxies = resolveBatchProxies(options, allProfiles.length);
+  const selectedProfiles = selectBatchWalletProfiles(allProfiles, options, "batch-aura");
+  const walletPlan = getBatchPlan(selectedProfiles.length, options.delayMs, options.jitterMs);
+  const concurrency = parsePositiveIntegerOption(options.concurrency ?? "3", "concurrency");
+  const semaphore = new ApiActionSemaphore(concurrency);
+
+  console.log(`[batch-aura] wallets=${selectedProfiles.length}, file=${filePath}, concurrency=${concurrency}, mode=${options.browser ? "browser" : "api"}`);
+
+  if (options.browser) {
+    const results = await runBrowserBatchAuraCheck({
+      selectedProfiles,
+      proxies,
+      config,
+      options
+    });
+    writeBatchAuraReport(results, filePath, options.output);
+    return;
+  }
+
+  const tasks: Array<Promise<{ ok: boolean; [key: string]: unknown }>> = [];
+  let scheduledAfterMsTotal = 0;
+
+  for (let index = 0; index < selectedProfiles.length; index += 1) {
+    const selected = selectedProfiles[index];
+    const profile = selected.profile;
+    const proxyUrl = proxies[selected.originalIndex] ?? config.proxyUrl;
+    const launchDelayMs = walletPlan[index];
+
+    logBatchProgress("aura", index, selectedProfiles.length, profile.name, launchDelayMs);
+
+    if (launchDelayMs > 0) {
+      await sleep(launchDelayMs);
+    }
+
+    scheduledAfterMsTotal += launchDelayMs;
+    const scheduledAfterMs = scheduledAfterMsTotal;
+
+    const task = semaphore.run(async () => {
+      const ownerKeypair = loadKeypair(profile.ownerSecretKey);
+      const accountAddress = profile.accountAddress ?? ownerKeypair.pubkey;
+
+      try {
+        const result = await checkPredepositAura(accountAddress, proxyUrl);
+        const status = result.found ? "ok" : "missing";
+        console.log(`[aura ${status}] ${profile.name} -> rank=${result.rank ?? "-"} aura=${result.aura ?? "-"}`);
+
+        return {
+          ok: true,
+          name: profile.name,
+          account: accountAddress,
+          proxyUsed: maskProxyUrl(proxyUrl),
+          scheduledAfterMs,
+          launchDelayMs,
+          aura: result
+        };
+      } catch (error) {
+        console.log(`[aura error] ${profile.name}: ${formatError(error)}`);
+        return {
+          ok: false,
+          name: profile.name,
+          account: accountAddress,
+          proxyUsed: maskProxyUrl(proxyUrl),
+          scheduledAfterMs,
+          launchDelayMs,
+          error: formatError(error)
+        };
+      }
+    });
+
+    tasks.push(task);
+  }
+
+  const results = await Promise.all(tasks);
+  writeBatchAuraReport(results, filePath, options.output);
+}
+
+async function runBrowserBatchAuraCheck(input: {
+  selectedProfiles: Array<{ profile: WalletProfile; originalIndex: number }>;
+  proxies: Array<string | undefined>;
+  config: EnvConfig;
+  options: BatchAuraCommandOptions;
+}): Promise<Array<{ ok: boolean; [key: string]: unknown }>> {
+  const walletPlan = getBatchPlan(input.selectedProfiles.length, input.options.delayMs, input.options.jitterMs);
+  const addresses: string[] = [];
+  const metadata: Array<{ name: string; account: string; proxyUrl?: string | null; launchDelayMs: number; scheduledAfterMs: number }> = [];
+  let scheduledAfterMsTotal = 0;
+
+  for (let index = 0; index < input.selectedProfiles.length; index += 1) {
+    const selected = input.selectedProfiles[index];
+    const profile = selected.profile;
+    const proxyUrl = input.proxies[selected.originalIndex] ?? input.config.proxyUrl;
+    const ownerKeypair = loadKeypair(profile.ownerSecretKey);
+    const account = profile.accountAddress ?? ownerKeypair.pubkey;
+    const launchDelayMs = walletPlan[index];
+
+    logBatchProgress("aura", index, input.selectedProfiles.length, profile.name, launchDelayMs);
+
+    if (launchDelayMs > 0) {
+      await sleep(launchDelayMs);
+    }
+
+    scheduledAfterMsTotal += launchDelayMs;
+    addresses.push(account);
+    metadata.push({
+      name: profile.name,
+      account,
+      proxyUrl,
+      launchDelayMs,
+      scheduledAfterMs: scheduledAfterMsTotal
+    });
+  }
+
+  const auraResults = await checkPredepositAuraWithChrome(addresses);
+
+  return auraResults.map((result, index) => {
+    const meta = metadata[index];
+    const status = result.found ? "ok" : "missing";
+    console.log(`[aura ${status}] ${meta.name} -> rank=${result.rank ?? "-"} aura=${result.aura ?? "-"}`);
+
+    return {
+      ok: true,
+      name: meta.name,
+      account: meta.account,
+      proxyUsed: maskProxyUrl(meta.proxyUrl),
+      scheduledAfterMs: meta.scheduledAfterMs,
+      launchDelayMs: meta.launchDelayMs,
+      aura: result
+    };
+  });
+}
+
+function writeBatchAuraReport(
+  results: Array<{ ok: boolean; [key: string]: unknown }>,
+  filePath: string,
+  output?: string
+): void {
+  const report = {
+    ok: results.every((item) => item.ok === true),
+    file: filePath,
+    wallets: results
+  };
+
+  const table = results.map((item) => {
+    const aura = item.aura as { found?: boolean; rank?: number | null; aura?: number | null; referrals?: number | null; others?: number | null } | undefined;
+    return {
+      wallet: item.name,
+      account: item.account,
+      found: aura?.found ?? false,
+      rank: aura?.rank ?? null,
+      aura: aura?.aura ?? null,
+      referrals: aura?.referrals ?? null,
+      others: aura?.others ?? null,
+      ok: item.ok
+    };
+  });
+
+  console.table(table);
+
+  if (output) {
+    const outputPath = resolveWalletFile(output);
+    fs.writeFileSync(outputPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+    console.log(`[batch-aura] report=${outputPath}`);
+  }
+
+  console.log(JSON.stringify(report, null, 2));
+}
+
 async function runDailyCycleForIdentity(input: {
   api: BulkApiClient;
   config: EnvConfig;
@@ -2322,9 +2521,23 @@ function parseDailySymbols(raw: string, exchangeInfo: ExchangeSymbolInfo[]): str
   return Array.from(new Set(symbols));
 }
 
+interface BatchWalletSelectionOptions {
+  wallets?: string;
+  maxWallets?: string;
+  shuffleWallets?: boolean;
+}
+
 function selectBatchDailyCycleProfiles(
   profiles: WalletProfile[],
   options: BatchDailyCycleCommandOptions
+): Array<{ profile: WalletProfile; originalIndex: number }> {
+  return selectBatchWalletProfiles(profiles, options, "batch-daily-cycle");
+}
+
+function selectBatchWalletProfiles(
+  profiles: WalletProfile[],
+  options: BatchWalletSelectionOptions,
+  commandName: string
 ): Array<{ profile: WalletProfile; originalIndex: number }> {
   const requestedNames = options.wallets
     ? new Set(
@@ -2355,7 +2568,7 @@ function selectBatchDailyCycleProfiles(
   }
 
   if (selected.length === 0) {
-    fail("No wallets selected for batch-daily-cycle.");
+    fail(`No wallets selected for ${commandName}.`);
   }
 
   return selected;

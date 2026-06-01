@@ -6,5 +6,8 @@ dist/
 .proxies.txt
 .seeds.txt
 .activity-state.json
+.aura-points.json
+.aura-points.test.json
+.aura-chrome-profile/
 .wallets.failed.json
 *.log

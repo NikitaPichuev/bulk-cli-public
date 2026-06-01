@@ -209,3 +209,21 @@ http://login:password@host:port
 - `.wallets.failed.json`
 - `node_modules`
 - `dist`
+
+## AURA points checker
+
+Run:
+
+```powershell
+cd C:\script\bulk-public
+powershell -NoProfile -ExecutionPolicy Bypass -File .\aura-check.ps1
+```
+
+Manual command:
+
+```powershell
+cd C:\script\bulk-public
+node dist\cli.js batch-aura --file .wallets.json --browser --output .aura-points.json
+```
+
+The `--browser` mode opens local Chrome and reads AURA from `https://early.bulk.trade/api/aura/v1/aura/wallet/<address>` in the site page context. This is needed because direct Node requests can be blocked by Vercel protection. The JSON report is saved to `.aura-points.json`.
