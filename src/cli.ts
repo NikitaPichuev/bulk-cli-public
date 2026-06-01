@@ -75,6 +75,7 @@ interface BatchAuraCommandOptions extends BatchCommandOptions {
   output?: string;
   browser?: boolean;
   noFallback?: boolean;
+  verbose?: boolean;
 }
 
 interface DailyCycleSettings {
@@ -633,6 +634,7 @@ program
   .option("--output <path>", "Write full JSON report to a file", ".aura-points.json")
   .option("--browser", "Use hidden local Chrome session for Vercel-protected AURA API", false)
   .option("--no-fallback", "Do not fallback to hidden Chrome if direct API is blocked", false)
+  .option("--verbose", "Print full diagnostic logs and JSON report to terminal", false)
   .action(async (options: BatchAuraCommandOptions) => {
     await runBatchAuraCheck(options);
   });
@@ -1637,7 +1639,9 @@ async function runBatchAuraCheck(options: BatchAuraCommandOptions): Promise<void
   const concurrency = parsePositiveIntegerOption(options.concurrency ?? "3", "concurrency");
   const semaphore = new ApiActionSemaphore(concurrency);
 
-  console.log(`[batch-aura] wallets=${selectedProfiles.length}, file=${filePath}, concurrency=${concurrency}, mode=${options.browser ? "hidden-chrome" : "api"}`);
+  if (options.verbose) {
+    console.log(`[batch-aura] wallets=${selectedProfiles.length}, file=${filePath}, concurrency=${concurrency}, mode=${options.browser ? "hidden-chrome" : "api"}`);
+  }
 
   if (options.browser) {
     const results = await runBrowserBatchAuraCheck({
@@ -1646,7 +1650,7 @@ async function runBatchAuraCheck(options: BatchAuraCommandOptions): Promise<void
       config,
       options
     });
-    writeBatchAuraReport(results, filePath, options.output);
+    writeBatchAuraReport(results, filePath, options.output, options.verbose ?? false);
     return;
   }
 
@@ -1659,7 +1663,9 @@ async function runBatchAuraCheck(options: BatchAuraCommandOptions): Promise<void
     const proxyUrl = proxies[selected.originalIndex] ?? config.proxyUrl;
     const launchDelayMs = walletPlan[index];
 
-    logBatchProgress("aura", index, selectedProfiles.length, profile.name, launchDelayMs);
+    if (options.verbose) {
+      logBatchProgress("aura", index, selectedProfiles.length, profile.name, launchDelayMs);
+    }
 
     if (launchDelayMs > 0) {
       await sleep(launchDelayMs);
@@ -1674,8 +1680,10 @@ async function runBatchAuraCheck(options: BatchAuraCommandOptions): Promise<void
 
       try {
         const result = await checkPredepositAura(accountAddress, proxyUrl);
-        const status = result.found ? "ok" : "missing";
-        console.log(`[aura ${status}] ${profile.name} -> rank=${result.rank ?? "-"} aura=${result.aura ?? "-"}`);
+        if (options.verbose) {
+          const status = result.found ? "ok" : "missing";
+          console.log(`[aura ${status}] ${profile.name} -> rank=${result.rank ?? "-"} aura=${result.aura ?? "-"}`);
+        }
 
         return {
           ok: true,
@@ -1687,7 +1695,9 @@ async function runBatchAuraCheck(options: BatchAuraCommandOptions): Promise<void
           aura: result
         };
       } catch (error) {
-        console.log(`[aura error] ${profile.name}: ${formatError(error)}`);
+        if (options.verbose) {
+          console.log(`[aura error] ${profile.name}: ${formatError(error)}`);
+        }
         return {
           ok: false,
           name: profile.name,
@@ -1711,7 +1721,9 @@ async function runBatchAuraCheck(options: BatchAuraCommandOptions): Promise<void
   ));
 
   if (shouldFallback) {
-    console.log("[batch-aura] direct API blocked by Vercel, retrying via hidden Chrome context");
+    if (options.verbose) {
+      console.log("[batch-aura] direct API blocked by Vercel, retrying via hidden Chrome context");
+    }
     const fallbackResults = await runBrowserBatchAuraCheck({
       selectedProfiles,
       proxies,
@@ -1722,11 +1734,11 @@ async function runBatchAuraCheck(options: BatchAuraCommandOptions): Promise<void
         jitterMs: "0"
       }
     });
-    writeBatchAuraReport(fallbackResults, filePath, options.output);
+    writeBatchAuraReport(fallbackResults, filePath, options.output, options.verbose ?? false);
     return;
   }
 
-  writeBatchAuraReport(results, filePath, options.output);
+  writeBatchAuraReport(results, filePath, options.output, options.verbose ?? false);
 }
 
 async function runBrowserBatchAuraCheck(input: {
@@ -1748,7 +1760,9 @@ async function runBrowserBatchAuraCheck(input: {
     const account = profile.accountAddress ?? ownerKeypair.pubkey;
     const launchDelayMs = walletPlan[index];
 
-    logBatchProgress("aura", index, input.selectedProfiles.length, profile.name, launchDelayMs);
+    if (input.options.verbose) {
+      logBatchProgress("aura", index, input.selectedProfiles.length, profile.name, launchDelayMs);
+    }
 
     if (launchDelayMs > 0) {
       await sleep(launchDelayMs);
@@ -1769,8 +1783,10 @@ async function runBrowserBatchAuraCheck(input: {
 
   return auraResults.map((result, index) => {
     const meta = metadata[index];
-    const status = result.found ? "ok" : "missing";
-    console.log(`[aura ${status}] ${meta.name} -> rank=${result.rank ?? "-"} aura=${result.aura ?? "-"}`);
+    if (input.options.verbose) {
+      const status = result.found ? "ok" : "missing";
+      console.log(`[aura ${status}] ${meta.name} -> rank=${result.rank ?? "-"} aura=${result.aura ?? "-"}`);
+    }
 
     return {
       ok: true,
@@ -1787,7 +1803,8 @@ async function runBrowserBatchAuraCheck(input: {
 function writeBatchAuraReport(
   results: Array<{ ok: boolean; [key: string]: unknown }>,
   filePath: string,
-  output?: string
+  output?: string,
+  verbose = false
 ): void {
   const report = {
     ok: results.every((item) => item.ok === true),
@@ -1795,29 +1812,30 @@ function writeBatchAuraReport(
     wallets: results
   };
 
-  const table = results.map((item) => {
+  const rows = results.map((item) => {
     const aura = item.aura as { found?: boolean; rank?: number | null; aura?: number | null; referrals?: number | null; others?: number | null } | undefined;
     return {
       wallet: item.name,
-      account: item.account,
-      found: aura?.found ?? false,
-      rank: aura?.rank ?? null,
       aura: aura?.aura ?? null,
-      referrals: aura?.referrals ?? null,
-      others: aura?.others ?? null,
-      ok: item.ok
+      rank: aura?.rank ?? null
     };
   });
+  const totalAura = rows.reduce((sum, item) => sum + (typeof item.aura === "number" ? item.aura : 0), 0);
 
-  console.table(table);
+  console.log(`TOTAL_AURA=${totalAura}`);
+  console.table(rows);
 
   if (output) {
     const outputPath = resolveWalletFile(output);
     fs.writeFileSync(outputPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
-    console.log(`[batch-aura] report=${outputPath}`);
+    if (verbose) {
+      console.log(`[batch-aura] report=${outputPath}`);
+    }
   }
 
-  console.log(JSON.stringify(report, null, 2));
+  if (verbose) {
+    console.log(JSON.stringify(report, null, 2));
+  }
 }
 
 async function runDailyCycleForIdentity(input: {
