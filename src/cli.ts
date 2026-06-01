@@ -74,6 +74,7 @@ interface BatchAuraCommandOptions extends BatchCommandOptions {
   maxWallets?: string;
   output?: string;
   browser?: boolean;
+  noFallback?: boolean;
 }
 
 interface DailyCycleSettings {
@@ -630,7 +631,8 @@ program
   .option("--wallets <list>", "Comma-separated wallet names to include, for example wallet-1,wallet-7")
   .option("--max-wallets <count>", "Maximum number of wallets to process in this run")
   .option("--output <path>", "Write full JSON report to a file", ".aura-points.json")
-  .option("--browser", "Use local Chrome session for Vercel-protected AURA API", false)
+  .option("--browser", "Use hidden local Chrome session for Vercel-protected AURA API", false)
+  .option("--no-fallback", "Do not fallback to hidden Chrome if direct API is blocked", false)
   .action(async (options: BatchAuraCommandOptions) => {
     await runBatchAuraCheck(options);
   });
@@ -1635,7 +1637,7 @@ async function runBatchAuraCheck(options: BatchAuraCommandOptions): Promise<void
   const concurrency = parsePositiveIntegerOption(options.concurrency ?? "3", "concurrency");
   const semaphore = new ApiActionSemaphore(concurrency);
 
-  console.log(`[batch-aura] wallets=${selectedProfiles.length}, file=${filePath}, concurrency=${concurrency}, mode=${options.browser ? "browser" : "api"}`);
+  console.log(`[batch-aura] wallets=${selectedProfiles.length}, file=${filePath}, concurrency=${concurrency}, mode=${options.browser ? "hidden-chrome" : "api"}`);
 
   if (options.browser) {
     const results = await runBrowserBatchAuraCheck({
@@ -1702,6 +1704,28 @@ async function runBatchAuraCheck(options: BatchAuraCommandOptions): Promise<void
   }
 
   const results = await Promise.all(tasks);
+  const shouldFallback = !options.noFallback && results.some((item) => (
+    item.ok === false &&
+    typeof item.error === "string" &&
+    (item.error.includes("Vercel Security Checkpoint") || item.error.includes("HTTP 429"))
+  ));
+
+  if (shouldFallback) {
+    console.log("[batch-aura] direct API blocked by Vercel, retrying via hidden Chrome context");
+    const fallbackResults = await runBrowserBatchAuraCheck({
+      selectedProfiles,
+      proxies,
+      config,
+      options: {
+        ...options,
+        delayMs: "0",
+        jitterMs: "0"
+      }
+    });
+    writeBatchAuraReport(fallbackResults, filePath, options.output);
+    return;
+  }
+
   writeBatchAuraReport(results, filePath, options.output);
 }
 

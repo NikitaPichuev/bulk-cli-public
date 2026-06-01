@@ -223,7 +223,7 @@ Manual command:
 
 ```powershell
 cd C:\script\bulk-public
-node dist\cli.js batch-aura --file .wallets.json --browser --output .aura-points.json
+node dist\cli.js batch-aura --file .wallets.json --output .aura-points.json
 ```
 
-The `--browser` mode opens local Chrome and reads AURA from `https://early.bulk.trade/api/aura/v1/aura/wallet/<address>` in the site page context. This is needed because direct Node requests can be blocked by Vercel protection. The JSON report is saved to `.aura-points.json`.
+The checker reads AURA from `https://early.bulk.trade/api/aura/v1/aura/wallet/<address>`. If direct Node requests are blocked by Vercel protection, it automatically retries through a hidden local Chrome context. The JSON report is saved to `.aura-points.json`.

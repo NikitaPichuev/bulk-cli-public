@@ -27,9 +27,9 @@ export async function checkPredepositAuraWithChrome(addresses: string[]): Promis
   const chrome = childProcess.spawn(chromePath, [
     `--remote-debugging-port=${port}`,
     `--user-data-dir=${profileDir}`,
+    "--headless=new",
     "--no-first-run",
     "--disable-default-apps",
-    "--new-window",
     "https://early.bulk.trade/deposit"
   ], {
     detached: false,
@@ -61,7 +61,7 @@ async function checkOneInBrowser(client: CdpClient, address: string): Promise<Au
   let lastResult: AuraCheckResult | null = null;
   const walletSourceUrl = buildAuraWalletUrl(address);
   const walletPayload = await fetchJsonInBrowser(client, walletSourceUrl);
-  const walletParsed = parseAuraPayload(address, walletPayload, walletSourceUrl, "browser:wallet");
+  const walletParsed = parseAuraPayload(address, walletPayload, walletSourceUrl, "vercel-context:wallet");
 
   if (walletParsed.found) {
     return walletParsed;
@@ -72,7 +72,7 @@ async function checkOneInBrowser(client: CdpClient, address: string): Promise<Au
   for (const searchParam of AURA_SEARCH_PARAMS) {
     const sourceUrl = buildAuraLeaderboardUrl(searchParam, address);
     const payload = await fetchJsonInBrowser(client, sourceUrl);
-    const parsed = parseAuraPayload(address, payload, sourceUrl, `browser:${searchParam}`);
+    const parsed = parseAuraPayload(address, payload, sourceUrl, `vercel-context:${searchParam}`);
     lastResult = parsed;
 
     if (parsed.found) {

@@ -5,7 +5,6 @@ node .\dist\cli.js batch-aura `
   --file .wallets.json `
   --proxies-file .proxies.txt `
   --concurrency 3 `
-  --browser `
   --delay-ms 1000 `
   --jitter-ms 2000 `
   --output .aura-points.json
