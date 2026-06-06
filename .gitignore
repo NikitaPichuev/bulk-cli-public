@@ -9,5 +9,9 @@ dist/
 .aura-points.json
 .aura-points.test.json
 .aura-chrome-profile/
+.predeposit-leaderboard.json
+.predeposit-leaderboard.csv
+.predeposit-post.txt
+.predeposit-chrome-profile/
 .wallets.failed.json
 *.log

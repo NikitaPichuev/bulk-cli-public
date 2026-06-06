@@ -9,6 +9,7 @@ import { checkPredepositAuraWithChrome } from "./auraBrowser";
 import { loadConfig, upsertEnvFile } from "./config";
 import { createKeypair, createSigner, decodeEnvelope, decodeEnvelopeArray, loadKeypair, nextNonce, type NativeKeypair } from "./nativeBulk";
 import { configureNetworking, getVisibleIp, normalizeProxyUrlInput } from "./network";
+import { fetchAllPredepositLeaderboard, fetchPredepositLeaderboard } from "./predepositApi";
 import { submitSdkActions } from "./sdkBridge";
 import type { ActionEnvelope, EnvConfig, ExchangeSymbolInfo, FullAccountState, OrderTimeInForce, Position, WalletProfile } from "./types";
 import { loadProxyLines, loadWalletProfiles, resolveWalletFile, saveWalletProfiles } from "./walletProfiles";
@@ -76,6 +77,18 @@ interface BatchAuraCommandOptions extends BatchCommandOptions {
   browser?: boolean;
   noFallback?: boolean;
   verbose?: boolean;
+}
+
+interface PredepositCommandOptions {
+  page?: string;
+  pageSize?: string;
+  printRows?: string;
+  printAll?: boolean;
+  singlePage?: boolean;
+  output?: string;
+  csv?: string;
+  post?: string;
+  json?: boolean;
 }
 
 interface DailyCycleSettings {
@@ -637,6 +650,22 @@ program
   .option("--verbose", "Print full diagnostic logs and JSON report to terminal", false)
   .action(async (options: BatchAuraCommandOptions) => {
     await runBatchAuraCheck(options);
+  });
+
+program
+  .command("predeposit-leaderboard")
+  .description("Show global mainnet predeposit totals, top depositors, AURA, CSV, and post text")
+  .option("--page <number>", "Leaderboard page to fetch", "1")
+  .option("--page-size <count>", "Rows to fetch/export", "10000")
+  .option("--print-rows <count>", "Rows to print in terminal preview", "100")
+  .option("--print-all", "Print all fetched rows to terminal", false)
+  .option("--single-page", "Fetch only the requested page instead of all pages", false)
+  .option("--output <path>", "Write full JSON response to a file", ".predeposit-leaderboard.json")
+  .option("--csv <path>", "Write sortable CSV table to a file", ".predeposit-leaderboard.csv")
+  .option("--post <path>", "Write a ready-to-post text summary to a file", ".predeposit-post.txt")
+  .option("--json", "Print full JSON to terminal", false)
+  .action(async (options: PredepositCommandOptions) => {
+    await runPredepositLeaderboard(options);
   });
 
 program
@@ -1836,6 +1865,122 @@ function writeBatchAuraReport(
   if (verbose) {
     console.log(JSON.stringify(report, null, 2));
   }
+}
+
+async function runPredepositLeaderboard(options: PredepositCommandOptions): Promise<void> {
+  const page = parsePositiveIntegerOption(options.page ?? "1", "page");
+  const pageSize = parsePositiveIntegerOption(options.pageSize ?? "10000", "page-size");
+  const printRows = options.printAll ? Number.POSITIVE_INFINITY : parsePositiveIntegerOption(options.printRows ?? "100", "print-rows");
+  const result = options.singlePage
+    ? await fetchPredepositLeaderboard(page, pageSize)
+    : await fetchAllPredepositLeaderboard(pageSize);
+  const rows = result.rows.map((row) => ({
+    rank: row.rank ?? null,
+    wallet: row.wallet ?? null,
+    trader: shortWallet(row.wallet),
+    deposited: row.deposited_amount ?? 0,
+    current: row.current_amount ?? 0,
+    withdrawn: row.withdrawn_amount ?? 0,
+    aura: row.aura ?? 0,
+    auraRank: row.aura_rank ?? null,
+    auraPerDollar: row.current_amount && row.current_amount > 0 ? (row.aura ?? 0) / row.current_amount : 0
+  }));
+
+  const totalDeposited = result.totals.total_deposited_amount ?? 0;
+  const totalCurrent = result.totals.total_current_amount ?? 0;
+  const totalWithdrawn = result.totals.total_withdrawn_amount ?? 0;
+  const totalWallets = result.totals.total_wallets ?? result.total;
+  const depositorRows = rows.filter((row) => row.current > 0 || row.deposited > 0);
+  const postText = buildPredepositPost({
+    totalCurrent,
+    totalWallets: depositorRows.length || totalWallets,
+    rows: depositorRows
+  });
+
+  console.log(`TOTAL_DEPOSITED=$${formatUsd(totalDeposited)}`);
+  console.log(`TOTAL_CURRENT=$${formatUsd(totalCurrent)}`);
+  console.log(`TOTAL_WITHDRAWN=$${formatUsd(totalWithdrawn)}`);
+  console.log(`TOTAL_WALLETS=${totalWallets}`);
+  console.log(`DEPOSITORS=${depositorRows.length}`);
+  console.log(`FETCHED_ROWS=${rows.length}`);
+  console.log(`CSV=${resolveWalletFile(options.csv ?? ".predeposit-leaderboard.csv")}`);
+  console.log(`POST=${resolveWalletFile(options.post ?? ".predeposit-post.txt")}`);
+  console.log("");
+  console.table(rows.slice(0, printRows).map((row) => ({
+    rank: row.rank,
+    trader: row.trader,
+    deposited: `$${formatCompactUsd(row.deposited)}`,
+    current: `$${formatCompactUsd(row.current)}`,
+    withdrawn: `$${formatCompactUsd(row.withdrawn)}`,
+    aura: formatCompactNumber(row.aura),
+    auraPerDollar: row.auraPerDollar.toFixed(6)
+  })));
+
+  if (rows.length > printRows) {
+    console.log(`Printed ${printRows} of ${rows.length}. Full sortable table is in CSV.`);
+  }
+
+  if (options.output) {
+    fs.writeFileSync(resolveWalletFile(options.output), `${JSON.stringify(result, null, 2)}\n`, "utf8");
+  }
+
+  if (options.csv) {
+    fs.writeFileSync(resolveWalletFile(options.csv), buildPredepositCsv(rows), "utf8");
+  }
+
+  if (options.post) {
+    fs.writeFileSync(resolveWalletFile(options.post), `${postText}\n`, "utf8");
+    console.log(`[predeposit] post=${resolveWalletFile(options.post)}`);
+  }
+
+  if (options.json) {
+    console.log(JSON.stringify(result, null, 2));
+  }
+}
+
+function buildPredepositCsv(rows: Array<{
+  rank: number | null;
+  wallet: string | null;
+  deposited: number;
+  current: number;
+  withdrawn: number;
+  aura: number;
+  auraRank: number | null;
+  auraPerDollar: number;
+}>): string {
+  const header = ["rank", "wallet", "deposited", "current", "withdrawn", "aura", "aura_rank", "aura_per_dollar"];
+  const lines = rows.map((row) => [
+    row.rank ?? "",
+    row.wallet ?? "",
+    row.deposited,
+    row.current,
+    row.withdrawn,
+    row.aura,
+    row.auraRank ?? "",
+    row.auraPerDollar
+  ].map(csvCell).join(","));
+
+  return `${header.join(",")}\n${lines.join("\n")}\n`;
+}
+
+function buildPredepositPost(input: {
+  totalCurrent: number;
+  totalWallets: number;
+  rows: Array<{ deposited: number; current: number; aura: number; auraPerDollar: number }>;
+}): string {
+  const thresholds = [500, 1_000, 2_000, 5_000, 10_000, 25_000, 50_000];
+  const lines = [
+    `$${formatCompactUsd(input.totalCurrent)} in the predeposit pool today.`,
+    "",
+    `By deposit size, here's where you stand against ${input.totalWallets.toLocaleString("en-US")} wallets right now:`,
+    ""
+  ];
+
+  for (const threshold of thresholds) {
+    lines.push(`$${formatCompactUsd(threshold)} -> bigger than ${formatPercent(shareBelow(input.rows, threshold))} of depositors`);
+  }
+
+  return lines.join("\n");
 }
 
 async function runDailyCycleForIdentity(input: {
@@ -3134,6 +3279,66 @@ function isRetryableConnectError(error: unknown): boolean {
 
 function randomInt(min: number, max: number): number {
   return min + Math.floor(Math.random() * (max - min + 1));
+}
+
+function formatUsd(value: number): string {
+  return value.toLocaleString("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+  });
+}
+
+function formatCompactUsd(value: number): string {
+  if (value >= 1_000_000) {
+    return `${stripTrailingZeroes((value / 1_000_000).toFixed(2))}M`;
+  }
+
+  if (value >= 1_000) {
+    return `${stripTrailingZeroes((value / 1_000).toFixed(1))}K`;
+  }
+
+  return stripTrailingZeroes(value.toFixed(2));
+}
+
+function formatCompactNumber(value: number): string {
+  if (value >= 1_000_000) {
+    return `${stripTrailingZeroes((value / 1_000_000).toFixed(2))}M`;
+  }
+
+  if (value >= 1_000) {
+    return `${stripTrailingZeroes((value / 1_000).toFixed(1))}K`;
+  }
+
+  return stripTrailingZeroes(value.toFixed(2));
+}
+
+function formatPercent(value: number): string {
+  return `${stripTrailingZeroes((value * 100).toFixed(1))}%`;
+}
+
+function shareBelow(rows: Array<{ current: number }>, threshold: number): number {
+  if (rows.length === 0) {
+    return 0;
+  }
+
+  return rows.filter((row) => row.current < threshold).length / rows.length;
+}
+
+function shortWallet(wallet?: string | null): string | null {
+  if (!wallet) {
+    return null;
+  }
+
+  if (wallet.length <= 12) {
+    return wallet;
+  }
+
+  return `${wallet.slice(0, 6)}...${wallet.slice(-4)}`;
+}
+
+function csvCell(value: unknown): string {
+  const text = String(value ?? "");
+  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 
 function resolveBatchProxies(options: BatchCommandOptions, walletCount: number): Array<string | undefined> {
